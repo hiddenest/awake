@@ -1,5 +1,5 @@
 #!/bin/bash
-# awake — keeps macOS awake while target processes are running
+# awake — keeps macOS awake while target processes are actively working
 # Bash 3.2 compatible (macOS /bin/bash — no associative arrays, mapfile, coproc)
 
 TARGETS=("claude" "codex" "opencode" "opencode-cli")
@@ -8,6 +8,8 @@ PID_FILE="/tmp/awake.pid"
 # Parallel indexed arrays aligned with TARGETS (bash 3.2: no associative arrays)
 CAFF_PIDS=()
 PROC_PIDS=()
+LAST_CPU=()    # last observed CPU time string per target
+IDLE_COUNT=()  # consecutive idle polls per target (grace window)
 
 # Flag: set to 1 only inside cmd_start so cleanup is a no-op for stop/status invocations
 IS_DAEMON=0
@@ -51,23 +53,55 @@ cmd_start() {
     IS_DAEMON=1
     echo "[awake] Started (PID $$)"
 
-    local i name proc_pid caff_pid old_pid
+    local i name proc_pid caff_pid old_pid cur_cpu last_cpu idle_count
     while true; do
         for i in "${!TARGETS[@]}"; do
             name="${TARGETS[$i]}"
             proc_pid=$(pgrep -x "$name" | head -1)
-            caff_pid="${CAFF_PIDS[$i]:-}"
 
             if [ -n "$proc_pid" ]; then
-                # Target is running — ensure caffeinate is active
-                if [ -z "$caff_pid" ] || ! kill -0 "$caff_pid" 2>/dev/null; then
-                    caffeinate -di -w "$proc_pid" &
-                    CAFF_PIDS[$i]=$!
+                # Measure CPU time to detect activity
+                cur_cpu=$(ps -p "$proc_pid" -o cputime= 2>/dev/null | tr -d ' ')
+                last_cpu="${LAST_CPU[$i]:-}"
+                idle_count="${IDLE_COUNT[$i]:-0}"
+
+                # New PID or first observation: treat as active
+                if [ "${PROC_PIDS[$i]:-}" != "$proc_pid" ]; then
                     PROC_PIDS[$i]=$proc_pid
-                    echo "[awake] Detected $name (PID $proc_pid) — caffeinate active"
+                    LAST_CPU[$i]="$cur_cpu"
+                    IDLE_COUNT[$i]=0
+                    idle_count=0
+                elif [ -n "$cur_cpu" ] && [ "$cur_cpu" != "$last_cpu" ]; then
+                    # CPU time changed — process is working
+                    LAST_CPU[$i]="$cur_cpu"
+                    IDLE_COUNT[$i]=0
+                    idle_count=0
+                else
+                    # CPU time unchanged — increment idle counter
+                    idle_count=$((idle_count + 1))
+                    IDLE_COUNT[$i]=$idle_count
+                fi
+
+                caff_pid="${CAFF_PIDS[$i]:-}"
+
+                if [ "$idle_count" -lt 3 ]; then
+                    # Active (or within grace window) — ensure caffeinate is running
+                    if [ -z "$caff_pid" ] || ! kill -0 "$caff_pid" 2>/dev/null; then
+                        caffeinate -di &
+                        CAFF_PIDS[$i]=$!
+                        echo "[awake] $name (PID $proc_pid) is active — caffeinate started"
+                    fi
+                else
+                    # Idle beyond grace window — release caffeinate
+                    if [ -n "$caff_pid" ] && kill -0 "$caff_pid" 2>/dev/null; then
+                        kill "$caff_pid" 2>/dev/null
+                        CAFF_PIDS[$i]=""
+                        echo "[awake] $name (PID $proc_pid) idle — caffeinate released"
+                    fi
                 fi
             else
                 # Target is not running — release caffeinate if we had one
+                caff_pid="${CAFF_PIDS[$i]:-}"
                 if [ -n "${PROC_PIDS[$i]:-}" ]; then
                     old_pid="${PROC_PIDS[$i]}"
                     if [ -n "$caff_pid" ] && kill -0 "$caff_pid" 2>/dev/null; then
@@ -75,6 +109,8 @@ cmd_start() {
                     fi
                     CAFF_PIDS[$i]=""
                     PROC_PIDS[$i]=""
+                    LAST_CPU[$i]=""
+                    IDLE_COUNT[$i]=0
                     echo "[awake] $name (PID $old_pid) exited — caffeinate released"
                 fi
             fi
@@ -130,14 +166,14 @@ cmd_status() {
     for name in "${TARGETS[@]}"; do
         proc_pid=$(pgrep -x "$name" | head -1)
         if [ -n "$proc_pid" ]; then
-            echo "[awake]   $name: detected (PID $proc_pid)"
+            echo "[awake]   $name: detected (PID $proc_pid) — checking CPU activity"
         else
             echo "[awake]   $name: not detected"
         fi
     done
 
     # Note: caffeinate active state is tracked only in the daemon process memory
-    echo "[awake]   caffeinate: active if any target is detected"
+    echo "[awake]   caffeinate: active only when target shows CPU activity (15s grace window)"
 }
 
 # --------------------------------------------------------------------------- #
