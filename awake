@@ -2,7 +2,7 @@
 # awake — keeps macOS awake while target processes are running
 # Bash 3.2 compatible (macOS /bin/bash — no associative arrays, mapfile, coproc)
 
-TARGETS=("claude" "codex")
+TARGETS=("claude" "codex" "opencode" "opencode-cli")
 PID_FILE="/tmp/awake.pid"
 
 # Parallel indexed arrays aligned with TARGETS (bash 3.2: no associative arrays)
