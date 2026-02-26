@@ -141,14 +141,91 @@ cmd_status() {
 }
 
 # --------------------------------------------------------------------------- #
+# cmd_install: create LaunchAgent plist and load it                           #
+# --------------------------------------------------------------------------- #
+cmd_install() {
+    local SCRIPT_PATH
+    SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    local PLIST_DIR="$HOME/Library/LaunchAgents"
+    local PLIST_FILE="$PLIST_DIR/com.awake.agent.plist"
+    local LOG_DIR="$HOME/Library/Logs"
+
+    mkdir -p "$PLIST_DIR"
+    mkdir -p "$LOG_DIR"
+
+    cat > "$PLIST_FILE" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.awake.agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$SCRIPT_PATH</string>
+        <string>start</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/awake.log</string>
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/awake.err</string>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>
+EOF
+
+    echo "[awake] Plist written to $PLIST_FILE"
+
+    if launchctl bootstrap "gui/$(id -u)" "$PLIST_FILE" 2>/dev/null; then
+        echo "[awake] LaunchAgent loaded via bootstrap"
+    elif launchctl load "$PLIST_FILE" 2>/dev/null; then
+        echo "[awake] LaunchAgent loaded via load (fallback)"
+    else
+        echo "[awake] Warning: failed to load LaunchAgent (plist still installed)"
+    fi
+}
+
+# --------------------------------------------------------------------------- #
+# cmd_uninstall: unload LaunchAgent and remove plist                          #
+# --------------------------------------------------------------------------- #
+cmd_uninstall() {
+    local PLIST_FILE="$HOME/Library/LaunchAgents/com.awake.agent.plist"
+
+    if launchctl bootout "gui/$(id -u)/com.awake.agent" 2>/dev/null; then
+        echo "[awake] LaunchAgent unloaded via bootout"
+    elif launchctl unload "$PLIST_FILE" 2>/dev/null; then
+        echo "[awake] LaunchAgent unloaded via unload (fallback)"
+    else
+        echo "[awake] Warning: failed to unload LaunchAgent (may not be loaded)"
+    fi
+
+    if [ -f "$PLIST_FILE" ]; then
+        rm -f "$PLIST_FILE"
+        echo "[awake] Plist removed: $PLIST_FILE"
+    else
+        echo "[awake] Plist not found: $PLIST_FILE"
+    fi
+}
+
+# --------------------------------------------------------------------------- #
 # Dispatch                                                                     #
 # --------------------------------------------------------------------------- #
 case "${1:-}" in
     start)  cmd_start ;;
     stop)   cmd_stop ;;
     status) cmd_status ;;
+    install)   cmd_install ;;
+    uninstall) cmd_uninstall ;;
     *)
-        echo "Usage: $0 {start|stop|status}"
+        echo "Usage: $0 {start|stop|status|install|uninstall}"
         exit 1
         ;;
 esac
