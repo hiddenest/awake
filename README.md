@@ -38,14 +38,12 @@ awake stop
 
 ### LaunchAgent (자동 시작)
 
-현재 `install` / `uninstall` 서브커맨드는 미구현 상태입니다. 수동으로 LaunchAgent plist를 작성하여 등록할 수 있습니다.
-
 ```bash
-# ~/Library/LaunchAgents/com.awake.plist 생성 후
-launchctl load ~/Library/LaunchAgents/com.awake.plist
+# LaunchAgent 설치 (로그인 시 자동 시작)
+awake install
 
-# 제거
-launchctl unload ~/Library/LaunchAgents/com.awake.plist
+# LaunchAgent 제거
+awake uninstall
 ```
 
 ## 감시 대상 프로세스
