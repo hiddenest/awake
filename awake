@@ -8,6 +8,9 @@ DEFAULT_CAFFEINATE_FLAGS="di"
 CAFFEINATE_FLAGS="$DEFAULT_CAFFEINATE_FLAGS"
 PARSED_CAFFEINATE_FLAGS=""
 CPU_TIME_DELTA_THRESHOLD_CS=1
+PMSET_DISABLED_BY_AWAKE=0
+PMSET_ORIGINAL_SLEEP_DISABLED=""
+PMSET_WARNING_SHOWN=0
 
 # Parallel indexed arrays aligned with TARGETS (bash 3.2: no associative arrays)
 CAFF_PIDS=()
@@ -108,6 +111,53 @@ parse_caffeinate_flags() {
     return 0
 }
 
+get_sleep_disabled_value() {
+    pmset -g 2>/dev/null | awk '/SleepDisabled/ { print $2; exit }'
+}
+
+run_pmset_command() {
+    if [ "$EUID" -eq 0 ]; then
+        pmset "$@"
+    else
+        sudo -n pmset "$@"
+    fi
+}
+
+warn_pmset_once() {
+    [ "$PMSET_WARNING_SHOWN" -eq 1 ] && return
+    PMSET_WARNING_SHOWN=1
+    echo "[awake] Warning: failed to toggle 'pmset -c disablesleep'; run awake as root or allow passwordless sudo for /usr/bin/pmset if you need lid-close sleep prevention" >&2
+}
+
+sync_pmset_sleep_disabled() {
+    local desired="$1"
+    local restore_value
+
+    if [ "$desired" -eq 1 ] && [ "$PMSET_DISABLED_BY_AWAKE" -eq 0 ]; then
+        if [ -z "$PMSET_ORIGINAL_SLEEP_DISABLED" ]; then
+            PMSET_ORIGINAL_SLEEP_DISABLED=$(get_sleep_disabled_value)
+        fi
+
+        if run_pmset_command -c disablesleep 1 >/dev/null 2>&1; then
+            PMSET_DISABLED_BY_AWAKE=1
+            echo "[awake] pmset -c disablesleep enabled"
+        else
+            warn_pmset_once
+        fi
+        return
+    fi
+
+    if [ "$desired" -eq 0 ] && [ "$PMSET_DISABLED_BY_AWAKE" -eq 1 ]; then
+        restore_value="${PMSET_ORIGINAL_SLEEP_DISABLED:-0}"
+        if run_pmset_command -c disablesleep "$restore_value" >/dev/null 2>&1; then
+            PMSET_DISABLED_BY_AWAKE=0
+            echo "[awake] pmset -c disablesleep restored to $restore_value"
+        else
+            warn_pmset_once
+        fi
+    fi
+}
+
 cleanup() {
     [ "$IS_DAEMON" -eq 0 ] && return
     [ "$CLEANUP_DONE" -eq 1 ] && return
@@ -120,6 +170,7 @@ cleanup() {
             kill "$cpid" 2>/dev/null
         fi
     done
+    sync_pmset_sleep_disabled 0
     rm -f "$PID_FILE"
 }
 
@@ -331,7 +382,7 @@ cmd_start() {
     IS_DAEMON=1
     echo "[awake] Started (PID $$, caffeinate -$CAFFEINATE_FLAGS)"
 
-    local i name proc_pid pids caff_pid old_pid idle_count target_active active_pid saw_new_pid
+    local i name proc_pid pids caff_pid old_pid idle_count target_active active_pid saw_new_pid any_active
     while true; do
         for i in "${!TARGETS[@]}"; do
             name="${TARGETS[$i]}"
@@ -412,6 +463,16 @@ cmd_start() {
             fi
         done
 
+        any_active=0
+        for i in "${!CAFF_PIDS[@]}"; do
+            caff_pid="${CAFF_PIDS[$i]:-}"
+            if [ -n "$caff_pid" ] && kill -0 "$caff_pid" 2>/dev/null; then
+                any_active=1
+                break
+            fi
+        done
+        sync_pmset_sleep_disabled "$any_active"
+
         # sleep in background + wait so SIGTERM/SIGINT interrupts wait immediately
         sleep 5 &
         wait $!
@@ -470,6 +531,7 @@ cmd_status() {
 
     # Note: caffeinate active state is tracked only in the daemon process memory
     echo "[awake]   caffeinate: active only when target shows child-process or CPU-time activity (15s grace window)"
+    echo "[awake]   pmset SleepDisabled: $(get_sleep_disabled_value)"
 }
 
 # --------------------------------------------------------------------------- #
