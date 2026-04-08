@@ -1,12 +1,12 @@
 # awake
 
-> A bash script that manages `caffeinate` and `pmset -c disablesleep` so macOS stays awake only while AI coding agents are actually working
+> A Rust CLI that manages `caffeinate` and `pmset -a disablesleep` so macOS stays awake only while AI coding agents are actually working
 
 ## Requirements
 
 - macOS
-- bash 3.2 or later (compatible with the default macOS `/bin/bash`)
-- You need permission to run `pmset -c disablesleep` if you want to prevent lid-close sleep
+- Rust and Cargo (to build the binary)
+- You need permission to run `pmset -a disablesleep` if you want to prevent lid-close sleep
 
 ## Quick start
 
@@ -15,19 +15,19 @@
 git clone <repo-url>
 cd experiments-claude-code-awake
 
-# Make the script executable
-chmod +x awake
+# Build the binary
+cargo build --release
 
 # Run the first-time setup flow
-./awake setup
+./target/release/awake setup
 ```
 
 `awake setup` performs the following steps automatically:
 
-1. Installs `awake` to `/usr/local/bin/awake`
+1. Installs the built `awake` binary to `/usr/local/bin/awake`
 2. Installs and loads the LaunchAgent
 3. Asks whether to enable lid-close sleep prevention while `awake` is active
-4. If you answer `y`, installs the `pmset` sudoers rule needed for automatic `pmset -c disablesleep` toggling
+4. If you answer `y`, installs the `pmset` sudoers rule needed for automatic `pmset -a disablesleep` toggling
 
 ## Usage
 
@@ -35,19 +35,19 @@ chmod +x awake
 
 ```bash
 # Run the interactive setup flow
-awake setup
+./target/release/awake setup
 
 # Start in the background
-awake start &
+./target/release/awake start &
 
 # Start in display-only mode
-awake start -D &
+./target/release/awake start -D &
 
 # Check status
-awake status
+./target/release/awake status
 
 # Stop
-awake stop
+./target/release/awake stop
 ```
 
 `awake start` and `awake install` accept the same options.
@@ -58,7 +58,7 @@ awake stop
 
 If no options are provided, the default is `caffeinate -di`.
 
-While real work is in progress, `awake` also tries `pmset -c disablesleep 1` and `pmset -b disablesleep 1` alongside `caffeinate -di`. When the work ends or `awake` exits, it restores the original `SleepDisabled` values for both AC power and battery.
+While real work is in progress, `awake` also tries `pmset -a disablesleep 1` alongside `caffeinate -di`. When the work ends or `awake` exits, it restores the original `SleepDisabled` value.
 Two privilege models are supported:
 
 - If `awake` itself runs as root, it calls `pmset` directly.
@@ -83,7 +83,7 @@ This lets `awake` run as a normal user while still allowing `pmset` sleep-preven
 #### 2. Alternative: run `awake` as root
 
 ```bash
-sudo ./awake start
+sudo ./target/release/awake start
 ```
 
 This is simpler operationally, but it gives root privileges to the entire script rather than just `pmset`.
@@ -111,7 +111,7 @@ awake uninstall
 - `opencode-cli` — OpenCode CLI (alias)
 - `pi` — Pi Coding Agent CLI
 
-When a process is detected, `awake` checks for activity signals every 5 seconds. Long-lived **server-style processes** such as `codex app-server` and `opencode serve` / `opencode web` / `opencode acp` are treated as active only when their direct child process count increases. Other CLI processes are treated as active when either their direct child process count increases or their CPU time increases by at least 0.01 seconds. If multiple processes share the same name, `awake` considers the target active when **any one of them** shows an activity signal. While a target is active, `awake` keeps the per-target `caffeinate` process alive and also attempts a global `pmset -c disablesleep 1` toggle when at least one target is active.
+When a process is detected, `awake` checks for activity signals every 5 seconds. Long-lived **server-style processes** such as `codex app-server` and `opencode serve` / `opencode web` / `opencode acp` are treated as active only when their direct child process count increases. Other CLI processes are treated as active when either their direct child process count increases or their CPU time increases by at least 0.01 seconds. If multiple processes share the same name, `awake` considers the target active when **any one of them** shows an activity signal. While a target is active, `awake` keeps the per-target `caffeinate` process alive and also attempts a global `pmset -a disablesleep 1` toggle when at least one target is active.
 New PIDs are not treated as active just because they appeared. If no activity signal appears for 3 consecutive polls (15 seconds), the target is treated as **idle** and `caffeinate` is released.
 If work resumes, `caffeinate` is activated again automatically.
 
@@ -126,7 +126,7 @@ Because Codex CLI is Node.js-based, its actual process name may appear as `node`
 3. For each detected process, it measures the direct child process count and `ps -o cputime` values for all matching PIDs.
 4. Server-style processes such as `codex app-server` and `opencode serve` / `opencode web` / `opencode acp` are considered **active** only when their direct child count increases.
 5. Other CLI processes are considered **active** when their direct child count increases or their CPU time increases by at least 0.01 seconds → `awake` starts `caffeinate` with the selected flags (default: `-di`).
-6. If any target is active, `awake` also attempts global `pmset -c disablesleep 1` and `pmset -b disablesleep 1` toggles (either via root execution or the `sudo -n` path).
+6. If any target is active, `awake` also attempts a global `pmset -a disablesleep 1` toggle (either via root execution or the `sudo -n` path).
 7. If no activity signal is seen for 3 consecutive polls (15 seconds), the target is treated as **idle** → `caffeinate` is released.
 8. When all active targets are gone, `awake` restores `pmset` to the original `SleepDisabled` values for both AC power and battery.
 9. If activity resumes, `caffeinate` / `pmset` are activated again.
