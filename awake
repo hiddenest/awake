@@ -2,18 +2,111 @@
 # awake — keeps macOS awake while target processes are actively working
 # Bash 3.2 compatible (macOS /bin/bash — no associative arrays, mapfile, coproc)
 
-TARGETS=("claude" "codex" "opencode" "opencode-cli")
+TARGETS=("claude" "codex" "opencode" "opencode-cli" "pi")
 PID_FILE="/tmp/awake.pid"
+DEFAULT_CAFFEINATE_FLAGS="di"
+CAFFEINATE_FLAGS="$DEFAULT_CAFFEINATE_FLAGS"
+PARSED_CAFFEINATE_FLAGS=""
+CPU_TIME_DELTA_THRESHOLD_CS=1
 
 # Parallel indexed arrays aligned with TARGETS (bash 3.2: no associative arrays)
 CAFF_PIDS=()
-PROC_PIDS=()
-LAST_CPU=()    # last observed CPU time string per target
+PROC_PIDS=()  # space-separated matching PIDs per target
+LAST_CPU=()    # per-target state string: "pid:cpu pid:cpu"
 IDLE_COUNT=()  # consecutive idle polls per target (grace window)
+CHILD_BASELINE=()  # per-target state string: "pid:count pid:count"
 
 # Flag: set to 1 only inside cmd_start so cleanup is a no-op for stop/status invocations
 IS_DAEMON=0
 CLEANUP_DONE=0
+
+usage() {
+    cat <<EOF
+Usage: $0 {start|stop|status|install|uninstall} [options]
+
+Options for start/install:
+  -D, -d, --display      Keep the display awake while a target is active
+  -i, --idle-system      Prevent idle system sleep while a target is active
+
+If no options are provided, awake uses the default caffeinate flags: -$DEFAULT_CAFFEINATE_FLAGS
+EOF
+}
+
+append_caffeinate_flag() {
+    local flag="$1"
+    local flags="$2"
+
+    case "$flags" in
+        *"$flag"*) printf '%s\n' "$flags" ;;
+        *) printf '%s%s\n' "$flags" "$flag" ;;
+    esac
+}
+
+parse_caffeinate_flags() {
+    local flags=""
+    local has_explicit_flags=0
+    local arg short_flags idx char
+
+    PARSED_CAFFEINATE_FLAGS=""
+
+    while [ $# -gt 0 ]; do
+        arg="$1"
+        case "$arg" in
+            --display)
+                flags=$(append_caffeinate_flag "d" "$flags")
+                has_explicit_flags=1
+                ;;
+            --idle-system)
+                flags=$(append_caffeinate_flag "i" "$flags")
+                has_explicit_flags=1
+                ;;
+            --help|-h)
+                usage
+                return 2
+                ;;
+            -*)
+                short_flags="${arg#-}"
+                if [ -z "$short_flags" ]; then
+                    echo "[awake] Unknown option: $arg" >&2
+                    usage >&2
+                    return 1
+                fi
+
+                for (( idx=0; idx<${#short_flags}; idx++ )); do
+                    char="${short_flags:$idx:1}"
+                    case "$char" in
+                        D|d)
+                            flags=$(append_caffeinate_flag "d" "$flags")
+                            has_explicit_flags=1
+                            ;;
+                        i)
+                            flags=$(append_caffeinate_flag "i" "$flags")
+                            has_explicit_flags=1
+                            ;;
+                        *)
+                            echo "[awake] Unknown option: -$char" >&2
+                            usage >&2
+                            return 1
+                            ;;
+                    esac
+                done
+                ;;
+            *)
+                echo "[awake] Unknown option: $arg" >&2
+                usage >&2
+                return 1
+                ;;
+        esac
+        shift
+    done
+
+    if [ "$has_explicit_flags" -eq 0 ]; then
+        flags="$DEFAULT_CAFFEINATE_FLAGS"
+    fi
+
+    PARSED_CAFFEINATE_FLAGS="$flags"
+    return 0
+}
 
 cleanup() {
     [ "$IS_DAEMON" -eq 0 ] && return
@@ -34,10 +127,195 @@ cleanup() {
 trap 'cleanup; exit 0' SIGTERM SIGINT
 trap cleanup EXIT
 
+count_direct_children() {
+    local pid="$1"
+
+    ps -axo ppid= | awk -v parent_pid="$pid" '
+        $1 == parent_pid { count++ }
+        END { print count+0 }
+    '
+}
+
+get_state_value() {
+    local state="$1"
+    local pid="$2"
+    local entry key value
+
+    for entry in $state; do
+        key="${entry%%:*}"
+        value="${entry#*:}"
+        if [ "$key" = "$pid" ]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+set_state_value() {
+    local state="$1"
+    local pid="$2"
+    local new_value="$3"
+    local entry key updated="" found=0
+
+    for entry in $state; do
+        key="${entry%%:*}"
+        if [ "$key" = "$pid" ]; then
+            entry="$pid:$new_value"
+            found=1
+        fi
+        if [ -n "$updated" ]; then
+            updated="$updated $entry"
+        else
+            updated="$entry"
+        fi
+    done
+
+    if [ "$found" -eq 0 ]; then
+        if [ -n "$updated" ]; then
+            updated="$updated $pid:$new_value"
+        else
+            updated="$pid:$new_value"
+        fi
+    fi
+
+    printf '%s\n' "$updated"
+}
+
+filter_state_to_pids() {
+    local state="$1"
+    shift
+    local pid entry key filtered=""
+
+    for entry in $state; do
+        key="${entry%%:*}"
+        for pid in "$@"; do
+            if [ "$key" = "$pid" ]; then
+                if [ -n "$filtered" ]; then
+                    filtered="$filtered $entry"
+                else
+                    filtered="$entry"
+                fi
+                break
+            fi
+        done
+    done
+
+    printf '%s\n' "$filtered"
+}
+
+cpu_time_to_centiseconds() {
+    local cpu_time="$1"
+
+    awk -v value="$cpu_time" '
+        BEGIN {
+            split(value, parts, /[:.]/)
+
+            hours = 0
+            minutes = 0
+            seconds = 0
+            centiseconds = 0
+
+            if (value ~ /^[0-9]+:[0-9]+:[0-9]+\.[0-9]+$/) {
+                hours = parts[1]
+                minutes = parts[2]
+                seconds = parts[3]
+                centiseconds = parts[4]
+            } else if (value ~ /^[0-9]+:[0-9]+\.[0-9]+$/) {
+                minutes = parts[1]
+                seconds = parts[2]
+                centiseconds = parts[3]
+            } else if (value ~ /^[0-9]+:[0-9]+:[0-9]+$/) {
+                hours = parts[1]
+                minutes = parts[2]
+                seconds = parts[3]
+            } else if (value ~ /^[0-9]+:[0-9]+$/) {
+                minutes = parts[1]
+                seconds = parts[2]
+            }
+
+            printf "%d\n", (((hours * 60) + minutes) * 60 + seconds) * 100 + centiseconds
+        }
+    '
+}
+
+is_server_process() {
+    local name="$1"
+    local pid="$2"
+    local args
+
+    args=$(ps -p "$pid" -o args= 2>/dev/null)
+
+    case "$name" in
+        codex)
+            case "$args" in
+                *" app-server"*|*" app-server "*) return 0 ;;
+            esac
+            ;;
+        opencode|opencode-cli)
+            case "$args" in
+                *" serve"*|*" serve "*) return 0 ;;
+            esac
+            ;;
+    esac
+
+    return 1
+}
+
+is_pid_active() {
+    local name="$1"
+    local pid="$2"
+    local index="$3"
+    local cur_cpu last_cpu baseline child_count cur_cpu_cs last_cpu_cs cpu_delta_cs
+
+    cur_cpu=$(ps -p "$pid" -o cputime= 2>/dev/null | tr -d ' ')
+    [ -z "$cur_cpu" ] && return 1
+
+    last_cpu=$(get_state_value "${LAST_CPU[$index]:-}" "$pid" 2>/dev/null)
+    baseline=$(get_state_value "${CHILD_BASELINE[$index]:-}" "$pid" 2>/dev/null)
+    baseline="${baseline:-0}"
+    child_count=$(count_direct_children "$pid")
+    cur_cpu_cs=$(cpu_time_to_centiseconds "$cur_cpu")
+
+    if [ "$child_count" -gt "$baseline" ]; then
+        LAST_CPU[$index]=$(set_state_value "${LAST_CPU[$index]:-}" "$pid" "$cur_cpu")
+        return 0
+    fi
+
+    if is_server_process "$name" "$pid"; then
+        LAST_CPU[$index]=$(set_state_value "${LAST_CPU[$index]:-}" "$pid" "$cur_cpu")
+        return 1
+    fi
+
+    if [ -n "$last_cpu" ]; then
+        last_cpu_cs=$(cpu_time_to_centiseconds "$last_cpu")
+        cpu_delta_cs=$((cur_cpu_cs - last_cpu_cs))
+    else
+        cpu_delta_cs=0
+    fi
+
+    if [ -n "$last_cpu" ] && [ "$cpu_delta_cs" -ge "$CPU_TIME_DELTA_THRESHOLD_CS" ]; then
+        LAST_CPU[$index]=$(set_state_value "${LAST_CPU[$index]:-}" "$pid" "$cur_cpu")
+        return 0
+    fi
+
+    LAST_CPU[$index]=$(set_state_value "${LAST_CPU[$index]:-}" "$pid" "$cur_cpu")
+    return 1
+}
+
 # --------------------------------------------------------------------------- #
 # cmd_start: enter polling loop                                                #
 # --------------------------------------------------------------------------- #
 cmd_start() {
+    parse_caffeinate_flags "$@"
+    case $? in
+        0) ;;
+        2) exit 0 ;;
+        *) exit 1 ;;
+    esac
+    CAFFEINATE_FLAGS="$PARSED_CAFFEINATE_FLAGS"
+
     # Check for existing live instance
     if [ -f "$PID_FILE" ]; then
         local existing_pid
@@ -51,33 +329,50 @@ cmd_start() {
 
     echo $$ > "$PID_FILE"
     IS_DAEMON=1
-    echo "[awake] Started (PID $$)"
+    echo "[awake] Started (PID $$, caffeinate -$CAFFEINATE_FLAGS)"
 
-    local i name proc_pid caff_pid old_pid cur_cpu last_cpu idle_count
+    local i name proc_pid pids caff_pid old_pid idle_count target_active active_pid saw_new_pid
     while true; do
         for i in "${!TARGETS[@]}"; do
             name="${TARGETS[$i]}"
-            proc_pid=$(pgrep -x "$name" | head -1)
+            pids=$(pgrep -x "$name" | tr '\n' ' ' | awk '{$1=$1; print}')
 
-            if [ -n "$proc_pid" ]; then
-                # Measure CPU time to detect activity
-                cur_cpu=$(ps -p "$proc_pid" -o cputime= 2>/dev/null | tr -d ' ')
-                last_cpu="${LAST_CPU[$i]:-}"
+            if [ -n "$pids" ]; then
                 idle_count="${IDLE_COUNT[$i]:-0}"
+                target_active=0
+                active_pid=""
+                saw_new_pid=0
 
-                # New PID or first observation: treat as active
-                if [ "${PROC_PIDS[$i]:-}" != "$proc_pid" ]; then
-                    PROC_PIDS[$i]=$proc_pid
-                    LAST_CPU[$i]="$cur_cpu"
+                LAST_CPU[$i]=$(filter_state_to_pids "${LAST_CPU[$i]:-}" $pids)
+                CHILD_BASELINE[$i]=$(filter_state_to_pids "${CHILD_BASELINE[$i]:-}" $pids)
+                PROC_PIDS[$i]="$pids"
+
+                for proc_pid in $pids; do
+                    if ! get_state_value "${CHILD_BASELINE[$i]:-}" "$proc_pid" >/dev/null 2>&1; then
+                        local initial_children
+                        initial_children=$(count_direct_children "$proc_pid")
+                        LAST_CPU[$i]=$(set_state_value "${LAST_CPU[$i]:-}" "$proc_pid" "$(ps -p "$proc_pid" -o cputime= 2>/dev/null | tr -d ' ')")
+                        CHILD_BASELINE[$i]=$(set_state_value "${CHILD_BASELINE[$i]:-}" "$proc_pid" "$initial_children")
+                        saw_new_pid=1
+                        if is_server_process "$name" "$proc_pid" && [ "$initial_children" -gt 0 ]; then
+                            target_active=1
+                            active_pid="$proc_pid"
+                            break
+                        fi
+                    elif is_pid_active "$name" "$proc_pid" "$i"; then
+                        target_active=1
+                        active_pid="$proc_pid"
+                        break
+                    fi
+                done
+
+                if [ "$target_active" -eq 1 ]; then
                     IDLE_COUNT[$i]=0
                     idle_count=0
-                elif [ -n "$cur_cpu" ] && [ "$cur_cpu" != "$last_cpu" ]; then
-                    # CPU time changed — process is working
-                    LAST_CPU[$i]="$cur_cpu"
-                    IDLE_COUNT[$i]=0
-                    idle_count=0
+                elif [ "$saw_new_pid" -eq 1 ]; then
+                    IDLE_COUNT[$i]=3
+                    idle_count=3
                 else
-                    # CPU time unchanged — increment idle counter
                     idle_count=$((idle_count + 1))
                     IDLE_COUNT[$i]=$idle_count
                 fi
@@ -87,16 +382,16 @@ cmd_start() {
                 if [ "$idle_count" -lt 3 ]; then
                     # Active (or within grace window) — ensure caffeinate is running
                     if [ -z "$caff_pid" ] || ! kill -0 "$caff_pid" 2>/dev/null; then
-                        caffeinate -di &
+                        caffeinate "-$CAFFEINATE_FLAGS" &
                         CAFF_PIDS[$i]=$!
-                        echo "[awake] $name (PID $proc_pid) is active — caffeinate started"
+                        echo "[awake] $name (PID ${active_pid:-$(printf '%s' "$pids" | awk 'NR==1{print $1}')}) is active — caffeinate -$CAFFEINATE_FLAGS started"
                     fi
                 else
                     # Idle beyond grace window — release caffeinate
                     if [ -n "$caff_pid" ] && kill -0 "$caff_pid" 2>/dev/null; then
                         kill "$caff_pid" 2>/dev/null
                         CAFF_PIDS[$i]=""
-                        echo "[awake] $name (PID $proc_pid) idle — caffeinate released"
+                        echo "[awake] $name idle — caffeinate released"
                     fi
                 fi
             else
@@ -110,6 +405,7 @@ cmd_start() {
                     CAFF_PIDS[$i]=""
                     PROC_PIDS[$i]=""
                     LAST_CPU[$i]=""
+                    CHILD_BASELINE[$i]=""
                     IDLE_COUNT[$i]=0
                     echo "[awake] $name (PID $old_pid) exited — caffeinate released"
                 fi
@@ -162,24 +458,33 @@ cmd_status() {
     echo "[awake] Status: running (PID $pid)"
 
     # Show which targets are currently detectable
-    local name proc_pid
+    local name pids
     for name in "${TARGETS[@]}"; do
-        proc_pid=$(pgrep -x "$name" | head -1)
-        if [ -n "$proc_pid" ]; then
-            echo "[awake]   $name: detected (PID $proc_pid) — checking CPU activity"
+        pids=$(pgrep -x "$name" | tr '\n' ' ' | awk '{$1=$1; print}')
+        if [ -n "$pids" ]; then
+            echo "[awake]   $name: detected (PIDs $pids) — checking activity"
         else
             echo "[awake]   $name: not detected"
         fi
     done
 
     # Note: caffeinate active state is tracked only in the daemon process memory
-    echo "[awake]   caffeinate: active only when target shows CPU activity (15s grace window)"
+    echo "[awake]   caffeinate: active only when target shows child-process or CPU-time activity (15s grace window)"
 }
 
 # --------------------------------------------------------------------------- #
 # cmd_install: create LaunchAgent plist and load it                           #
 # --------------------------------------------------------------------------- #
 cmd_install() {
+    local install_flags
+    parse_caffeinate_flags "$@"
+    case $? in
+        0) ;;
+        2) exit 0 ;;
+        *) exit 1 ;;
+    esac
+    install_flags="$PARSED_CAFFEINATE_FLAGS"
+
     local SCRIPT_PATH
     SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
     local PLIST_DIR="$HOME/Library/LaunchAgents"
@@ -201,6 +506,7 @@ cmd_install() {
     <array>
         <string>$SCRIPT_PATH</string>
         <string>start</string>
+        <string>-$install_flags</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -255,13 +561,19 @@ cmd_uninstall() {
 # Dispatch                                                                     #
 # --------------------------------------------------------------------------- #
 case "${1:-}" in
-    start)  cmd_start ;;
+    start)
+        shift
+        cmd_start "$@"
+        ;;
     stop)   cmd_stop ;;
     status) cmd_status ;;
-    install)   cmd_install ;;
+    install)
+        shift
+        cmd_install "$@"
+        ;;
     uninstall) cmd_uninstall ;;
     *)
-        echo "Usage: $0 {start|stop|status|install|uninstall}"
+        usage
         exit 1
         ;;
 esac
