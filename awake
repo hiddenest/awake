@@ -291,10 +291,83 @@ cpu_time_to_centiseconds() {
     '
 }
 
+get_opencode_subcommand() {
+    local pid="$1"
+    local args skip_next token next_token last_subcommand
+
+    args=$(ps -p "$pid" -o args= 2>/dev/null)
+    [ -z "$args" ] && return 1
+
+    case "$args" in
+        *" --prompt "*|*" --title "*)
+            # shellcheck disable=SC2086
+            set -- $args
+            shift
+            while [ $# -gt 0 ]; do
+                token="$1"
+                shift
+                case "$token" in
+                    run|attach|pr)
+                        printf '%s\n' "$token"
+                        return 0
+                        ;;
+                esac
+            done
+
+            return 1
+            ;;
+    esac
+
+    # shellcheck disable=SC2086
+    set -- $args
+    shift
+
+    skip_next=0
+    while [ $# -gt 0 ]; do
+        token="$1"
+        shift
+
+        if [ "$skip_next" -eq 1 ]; then
+            skip_next=0
+            continue
+        fi
+
+        case "$token" in
+            --log-level|--port|--hostname|--mdns-domain|--attach|--password|-p|--dir|--model|--agent|--format|--title|--variant|-s|--session|-c|--command|-m|-f|--file)
+                skip_next=1
+                continue
+                ;;
+            --*=*)
+                continue
+                ;;
+            --print-logs|--mdns|--fork|--share|--thinking|--continue|-h|--help|-v|--version)
+                continue
+                ;;
+            serve|web|acp|run|attach|pr)
+                printf '%s\n' "$token"
+                return 0
+                ;;
+            -*)
+                next_token="$1"
+                case "$next_token" in
+                    serve|web|acp|run|attach|pr|-*|'') ;;
+                    *) skip_next=1 ;;
+                esac
+                continue
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    done
+
+    return 1
+}
+
 is_server_process() {
     local name="$1"
     local pid="$2"
-    local args
+    local args opencode_subcommand
 
     args=$(ps -p "$pid" -o args= 2>/dev/null)
 
@@ -305,9 +378,24 @@ is_server_process() {
             esac
             ;;
         opencode|opencode-cli)
-            case "$args" in
-                *" serve"*|*" serve "*) return 0 ;;
+            opencode_subcommand=$(get_opencode_subcommand "$pid")
+            case "$opencode_subcommand" in
+                serve|web|acp) return 0 ;;
             esac
+            ;;
+    esac
+
+    return 1
+}
+
+should_activate_on_initial_server_children() {
+    local name="$1"
+    local pid="$2"
+
+    case "$name" in
+        codex)
+            is_server_process "$name" "$pid"
+            return $?
             ;;
     esac
 
@@ -405,7 +493,7 @@ cmd_start() {
                         LAST_CPU[$i]=$(set_state_value "${LAST_CPU[$i]:-}" "$proc_pid" "$(ps -p "$proc_pid" -o cputime= 2>/dev/null | tr -d ' ')")
                         CHILD_BASELINE[$i]=$(set_state_value "${CHILD_BASELINE[$i]:-}" "$proc_pid" "$initial_children")
                         saw_new_pid=1
-                        if is_server_process "$name" "$proc_pid" && [ "$initial_children" -gt 0 ]; then
+                        if should_activate_on_initial_server_children "$name" "$proc_pid" && [ "$initial_children" -gt 0 ]; then
                             target_active=1
                             active_pid="$proc_pid"
                             break

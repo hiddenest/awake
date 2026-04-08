@@ -98,7 +98,7 @@ awake uninstall
 - `opencode-cli` — OpenCode CLI (alias)
 - `pi` — Pi Coding Agent CLI
 
-When a process is detected, `awake` checks for activity signals every 5 seconds. Long-lived **server-style processes** such as `codex app-server` and `opencode serve` are treated as active only when their direct child process count increases. Other CLI processes are treated as active when either their direct child process count increases or their CPU time increases by at least 0.01 seconds. If multiple processes share the same name, `awake` considers the target active when **any one of them** shows an activity signal. While a target is active, `awake` keeps the per-target `caffeinate` process alive and also attempts a global `pmset -c disablesleep 1` toggle when at least one target is active.
+When a process is detected, `awake` checks for activity signals every 5 seconds. Long-lived **server-style processes** such as `codex app-server` and `opencode serve` / `opencode web` / `opencode acp` are treated as active only when their direct child process count increases. Other CLI processes are treated as active when either their direct child process count increases or their CPU time increases by at least 0.01 seconds. If multiple processes share the same name, `awake` considers the target active when **any one of them** shows an activity signal. While a target is active, `awake` keeps the per-target `caffeinate` process alive and also attempts a global `pmset -c disablesleep 1` toggle when at least one target is active.
 New PIDs are not treated as active just because they appeared. If no activity signal appears for 3 consecutive polls (15 seconds), the target is treated as **idle** and `caffeinate` is released.
 If work resumes, `caffeinate` is activated again automatically.
 
@@ -111,7 +111,7 @@ Because Codex CLI is Node.js-based, its actual process name may appear as `node`
 1. `awake start` creates a PID file (`/tmp/awake.pid`) and enters the polling loop.
 2. Every 5 seconds, it checks the `TARGETS` process names with `pgrep -x`.
 3. For each detected process, it measures the direct child process count and `ps -o cputime` values for all matching PIDs.
-4. Server-style processes such as `codex app-server` and `opencode serve` are considered **active** only when their direct child count increases.
+4. Server-style processes such as `codex app-server` and `opencode serve` / `opencode web` / `opencode acp` are considered **active** only when their direct child count increases.
 5. Other CLI processes are considered **active** when their direct child count increases or their CPU time increases by at least 0.01 seconds → `awake` starts `caffeinate` with the selected flags (default: `-di`).
 6. If any target is active, `awake` also attempts a global `pmset -c disablesleep 1` toggle (either via root execution or the `sudo -n` path).
 7. If no activity signal is seen for 3 consecutive polls (15 seconds), the target is treated as **idle** → `caffeinate` is released.
