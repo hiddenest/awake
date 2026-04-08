@@ -62,6 +62,34 @@ The built binary will be at:
 ./target/release/awake
 ```
 
+## Install with Homebrew
+
+`awake` is also distributed through a custom Homebrew tap:
+
+```bash
+brew tap hiddenest/awake
+brew install awake
+```
+
+Upgrade later with:
+
+```bash
+brew update
+brew upgrade awake
+```
+
+After installation, run:
+
+```bash
+awake setup
+```
+
+Tap repository:
+
+```text
+https://github.com/hiddenest/homebrew-awake
+```
+
 ## Quick start
 
 For a first-time local install:
