@@ -11,6 +11,8 @@ CPU_TIME_DELTA_THRESHOLD_CS=1
 PMSET_DISABLED_BY_AWAKE=0
 PMSET_ORIGINAL_SLEEP_DISABLED=""
 PMSET_WARNING_SHOWN=0
+SYSTEM_INSTALL_PATH="${AWAKE_INSTALL_PATH:-/usr/local/bin/awake}"
+PMSET_SUDOERS_PATH="${AWAKE_PMSET_SUDOERS_PATH:-/etc/sudoers.d/awake-pmset}"
 
 # Parallel indexed arrays aligned with TARGETS (bash 3.2: no associative arrays)
 CAFF_PIDS=()
@@ -25,14 +27,26 @@ CLEANUP_DONE=0
 
 usage() {
     cat <<EOF
-Usage: $0 {start|stop|status|install|uninstall} [options]
+Usage: $0 {start|stop|status|setup|install|uninstall} [options]
 
-Options for start/install:
+Options for start/install/setup:
   -D, -d, --display      Keep the display awake while a target is active
   -i, --idle-system      Prevent idle system sleep while a target is active
 
 If no options are provided, awake uses the default caffeinate flags: -$DEFAULT_CAFFEINATE_FLAGS
 EOF
+}
+
+get_script_path() {
+    printf '%s/%s\n' "$(cd "$(dirname "$0")" && pwd)" "$(basename "$0")"
+}
+
+run_setup_privileged_command() {
+    if [ "$EUID" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
 }
 
 append_caffeinate_flag() {
@@ -127,6 +141,65 @@ warn_pmset_once() {
     [ "$PMSET_WARNING_SHOWN" -eq 1 ] && return
     PMSET_WARNING_SHOWN=1
     echo "[awake] Warning: failed to toggle 'pmset -c disablesleep'; run awake as root or allow passwordless sudo for /usr/bin/pmset if you need lid-close sleep prevention" >&2
+}
+
+install_script_systemwide() {
+    local source_path target_path target_dir
+
+    source_path=$(get_script_path)
+    target_path="$SYSTEM_INSTALL_PATH"
+    target_dir="${target_path%/*}"
+
+    if [ "$source_path" = "$target_path" ]; then
+        echo "[awake] Script already installed at $target_path"
+        return 0
+    fi
+
+    if run_setup_privileged_command mkdir -p "$target_dir" && run_setup_privileged_command install -m 755 "$source_path" "$target_path"; then
+        echo "[awake] Installed script to $target_path"
+        return 0
+    fi
+
+    echo "[awake] Failed to install script to $target_path" >&2
+    return 1
+}
+
+setup_pmset_privilege() {
+    local setup_user temp_file sudoers_dir
+
+    setup_user="${SUDO_USER:-$USER}"
+    sudoers_dir="${PMSET_SUDOERS_PATH%/*}"
+    temp_file=$(mktemp) || return 1
+
+    printf '%s ALL=(root) NOPASSWD: /usr/bin/pmset\n' "$setup_user" > "$temp_file"
+
+    if run_setup_privileged_command mkdir -p "$sudoers_dir" && run_setup_privileged_command install -m 440 "$temp_file" "$PMSET_SUDOERS_PATH"; then
+        rm -f "$temp_file"
+        echo "[awake] Installed pmset sudoers rule for $setup_user at $PMSET_SUDOERS_PATH"
+        return 0
+    fi
+
+    rm -f "$temp_file"
+    echo "[awake] Failed to install pmset sudoers rule" >&2
+    return 1
+}
+
+should_enable_lid_close_prevention() {
+    local answer
+
+    if [ ! -t 0 ]; then
+        echo "[awake] Non-interactive input detected — skipping lid-close sleep prevention setup"
+        return 1
+    fi
+
+    printf '[awake] Prevent sleep when the lid is closed while awake is active? (y/N): '
+    IFS= read -r answer || return 1
+
+    case "$answer" in
+        y|Y|yes|YES) return 0 ;;
+    esac
+
+    return 1
 }
 
 sync_pmset_sleep_disabled() {
@@ -636,7 +709,7 @@ cmd_install() {
     install_flags="$PARSED_CAFFEINATE_FLAGS"
 
     local SCRIPT_PATH
-    SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    SCRIPT_PATH="$(get_script_path)"
     local PLIST_DIR="$HOME/Library/LaunchAgents"
     local PLIST_FILE="$PLIST_DIR/com.awake.agent.plist"
     local LOG_DIR="$HOME/Library/Logs"
@@ -686,6 +759,36 @@ EOF
 }
 
 # --------------------------------------------------------------------------- #
+# cmd_setup: install script + LaunchAgent + optional pmset privilege          #
+# --------------------------------------------------------------------------- #
+cmd_setup() {
+    local install_flags installed_path
+
+    parse_caffeinate_flags "$@"
+    case $? in
+        0) ;;
+        2) exit 0 ;;
+        *) exit 1 ;;
+    esac
+    install_flags="$PARSED_CAFFEINATE_FLAGS"
+    installed_path="$SYSTEM_INSTALL_PATH"
+
+    install_script_systemwide || exit 1
+
+    if [ "$installed_path" = "$(get_script_path)" ]; then
+        cmd_install "-$install_flags"
+    else
+        "$installed_path" install "-$install_flags" || exit 1
+    fi
+
+    if should_enable_lid_close_prevention; then
+        setup_pmset_privilege || exit 1
+    else
+        echo "[awake] Skipped lid-close sleep prevention setup"
+    fi
+}
+
+# --------------------------------------------------------------------------- #
 # cmd_uninstall: unload LaunchAgent and remove plist                          #
 # --------------------------------------------------------------------------- #
 cmd_uninstall() {
@@ -720,6 +823,10 @@ case "${1:-}" in
     install)
         shift
         cmd_install "$@"
+        ;;
+    setup)
+        shift
+        cmd_setup "$@"
         ;;
     uninstall) cmd_uninstall ;;
     *)

@@ -18,15 +18,25 @@ cd experiments-claude-code-awake
 # Make the script executable
 chmod +x awake
 
-# Add it to PATH (optional)
-sudo cp awake /usr/local/bin/awake
+# Run the first-time setup flow
+./awake setup
 ```
+
+`awake setup` performs the following steps automatically:
+
+1. Installs `awake` to `/usr/local/bin/awake`
+2. Installs and loads the LaunchAgent
+3. Asks whether to enable lid-close sleep prevention while `awake` is active
+4. If you answer `y`, installs the `pmset` sudoers rule needed for automatic `pmset -c disablesleep` toggling
 
 ## Usage
 
 ### Manual usage
 
 ```bash
+# Run the interactive setup flow
+awake setup
+
 # Start in the background
 awake start &
 
@@ -41,6 +51,7 @@ awake stop
 ```
 
 `awake start` and `awake install` accept the same options.
+`awake setup` accepts the same flags and passes them through to the installed LaunchAgent.
 
 - `-D`, `-d`, `--display` — keep the display awake while a target is active
 - `-i`, `--idle-system` — prevent idle system sleep while a target is active
@@ -56,6 +67,8 @@ Two privilege models are supported:
 If non-interactive `sudo` is not available and `awake` is not running as root, the `pmset` toggle is skipped and only a warning is printed.
 
 ### Granting `pmset` permission
+
+If you answer `y` during `awake setup`, the script installs this sudoers rule for you automatically.
 
 #### 1. Recommended: allow NOPASSWD for `pmset` only
 
