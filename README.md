@@ -58,7 +58,7 @@ awake stop
 
 If no options are provided, the default is `caffeinate -di`.
 
-While real work is in progress, `awake` also tries `pmset -c disablesleep 1` alongside `caffeinate -di`. When the work ends or `awake` exits, it restores the original `SleepDisabled` value.
+While real work is in progress, `awake` also tries `pmset -c disablesleep 1` and `pmset -b disablesleep 1` alongside `caffeinate -di`. When the work ends or `awake` exits, it restores the original `SleepDisabled` values for both AC power and battery.
 Two privilege models are supported:
 
 - If `awake` itself runs as root, it calls `pmset` directly.
@@ -78,7 +78,7 @@ Add a sudoers rule like this with `visudo`:
 your_username ALL=(root) NOPASSWD: /usr/bin/pmset
 ```
 
-This lets `awake` run as a normal user while still allowing `pmset -c disablesleep` to run without a password.
+This lets `awake` run as a normal user while still allowing `pmset` sleep-prevention commands to run without a password.
 
 #### 2. Alternative: run `awake` as root
 
@@ -126,9 +126,9 @@ Because Codex CLI is Node.js-based, its actual process name may appear as `node`
 3. For each detected process, it measures the direct child process count and `ps -o cputime` values for all matching PIDs.
 4. Server-style processes such as `codex app-server` and `opencode serve` / `opencode web` / `opencode acp` are considered **active** only when their direct child count increases.
 5. Other CLI processes are considered **active** when their direct child count increases or their CPU time increases by at least 0.01 seconds → `awake` starts `caffeinate` with the selected flags (default: `-di`).
-6. If any target is active, `awake` also attempts a global `pmset -c disablesleep 1` toggle (either via root execution or the `sudo -n` path).
+6. If any target is active, `awake` also attempts global `pmset -c disablesleep 1` and `pmset -b disablesleep 1` toggles (either via root execution or the `sudo -n` path).
 7. If no activity signal is seen for 3 consecutive polls (15 seconds), the target is treated as **idle** → `caffeinate` is released.
-8. When all active targets are gone, `awake` restores `pmset` to the original `SleepDisabled` value.
+8. When all active targets are gone, `awake` restores `pmset` to the original `SleepDisabled` values for both AC power and battery.
 9. If activity resumes, `caffeinate` / `pmset` are activated again.
 10. When a target process exits, `caffeinate` is released immediately.
 11. On `awake stop` or SIGTERM, `awake` kills all `caffeinate` processes, removes the PID file, and attempts to restore `pmset`.
@@ -147,8 +147,8 @@ awake status
 # Inspect caffeinate processes directly
 pgrep -a caffeinate
 
-# Check the current SleepDisabled value
-pmset -g | grep SleepDisabled
+# Check the current SleepDisabled values
+pmset -g custom | grep disablesleep
 ```
 
 If `pmset -g assertions` shows `PreventUserIdleDisplaySleep` or `PreventUserIdleSystemSleep`, `caffeinate` is working as expected.

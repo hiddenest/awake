@@ -140,7 +140,7 @@ run_pmset_command() {
 warn_pmset_once() {
     [ "$PMSET_WARNING_SHOWN" -eq 1 ] && return
     PMSET_WARNING_SHOWN=1
-    echo "[awake] Warning: failed to toggle 'pmset -c disablesleep'; run awake as root or allow passwordless sudo for /usr/bin/pmset if you need lid-close sleep prevention" >&2
+    echo "[awake] Warning: failed to toggle 'pmset -a disablesleep'; run awake as root or allow passwordless sudo for /usr/bin/pmset if you need lid-close sleep prevention" >&2
 }
 
 install_script_systemwide() {
@@ -211,9 +211,9 @@ sync_pmset_sleep_disabled() {
             PMSET_ORIGINAL_SLEEP_DISABLED=$(get_sleep_disabled_value)
         fi
 
-        if run_pmset_command -c disablesleep 1 >/dev/null 2>&1; then
+        if run_pmset_command -a disablesleep 1 >/dev/null 2>&1; then
             PMSET_DISABLED_BY_AWAKE=1
-            echo "[awake] pmset -c disablesleep enabled"
+            echo "[awake] pmset -a disablesleep enabled"
         else
             warn_pmset_once
         fi
@@ -222,9 +222,9 @@ sync_pmset_sleep_disabled() {
 
     if [ "$desired" -eq 0 ] && [ "$PMSET_DISABLED_BY_AWAKE" -eq 1 ]; then
         restore_value="${PMSET_ORIGINAL_SLEEP_DISABLED:-0}"
-        if run_pmset_command -c disablesleep "$restore_value" >/dev/null 2>&1; then
+        if run_pmset_command -a disablesleep "$restore_value" >/dev/null 2>&1; then
             PMSET_DISABLED_BY_AWAKE=0
-            echo "[awake] pmset -c disablesleep restored to $restore_value"
+            echo "[awake] pmset disablesleep restored to $restore_value"
         else
             warn_pmset_once
         fi
