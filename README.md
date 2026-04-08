@@ -1,154 +1,296 @@
 # awake
 
-> A Rust CLI that manages `caffeinate` and `pmset -a disablesleep` so macOS stays awake only while AI coding agents are actually working
+`awake` is a macOS CLI that keeps your machine awake **only while supported AI coding CLIs are doing real work**.
+
+Instead of holding a permanent `caffeinate` assertion, `awake` watches known agent processes, checks whether they are actually active, and only then enables:
+
+- `caffeinate` for display and/or idle-sleep prevention
+- `pmset -a disablesleep` for lid-close sleep prevention when permissions allow it
+
+When activity stops, `awake` releases the assertion and restores the previous `SleepDisabled` setting.
+
+## What it watches
+
+`awake` watches these exact process names:
+
+- `claude`
+- `codex`
+- `opencode`
+- `opencode-cli`
+- `pi`
+
+## How activity detection works
+
+The daemon polls every **5 seconds**.
+
+For normal CLI processes, `awake` treats a process as active when either of these changes between polls:
+
+- the direct child-process count increases
+- the process CPU time increases by at least `0.01s`
+
+For server-style processes, `awake` is stricter:
+
+- `codex app-server`
+- `opencode serve`
+- `opencode web`
+- `opencode acp`
+- `opencode-cli serve`
+- `opencode-cli web`
+- `opencode-cli acp`
+
+These activate on **child-process activity only**, not CPU-only changes.
+
+Newly discovered PIDs do not count as active just because they appeared. If no activity is seen for 3 polls in a row, the target is treated as idle and its `caffeinate` process is released.
 
 ## Requirements
 
 - macOS
-- Rust and Cargo (to build the binary)
-- You need permission to run `pmset -a disablesleep` if you want to prevent lid-close sleep
+- Rust and Cargo to build from source
+- Permission to run `pmset` if you want lid-close sleep prevention
+
+## Build
+
+```bash
+git clone <repo-url>
+cd awake
+cargo build --release
+```
+
+The built binary will be at:
+
+```bash
+./target/release/awake
+```
 
 ## Quick start
 
+For a first-time local install:
+
 ```bash
-# Clone the repository
-git clone <repo-url>
-cd experiments-claude-code-awake
-
-# Build the binary
-cargo build --release
-
-# Run the first-time setup flow
 ./target/release/awake setup
 ```
 
-`awake setup` performs the following steps automatically:
+`setup` does the following:
 
-1. Installs the built `awake` binary to `/usr/local/bin/awake`
-2. Installs and loads the LaunchAgent
-3. Asks whether to enable lid-close sleep prevention while `awake` is active
-4. If you answer `y`, installs the `pmset` sudoers rule needed for automatic `pmset -a disablesleep` toggling
+1. installs or reuses `/usr/local/bin/awake`
+2. installs and loads the LaunchAgent
+3. asks whether to configure lid-close sleep prevention
+4. if you answer `y`, installs a sudoers rule for `/usr/bin/pmset`
 
-## Usage
+## Updating an existing local install
 
-### Manual usage
+If `/usr/local/bin/awake` already exists and you want to replace it with the Rust binary:
 
 ```bash
-# Run the interactive setup flow
-./target/release/awake setup
+cargo build --release
+sudo install -m 755 target/release/awake /usr/local/bin/awake
+```
 
-# Start in the background
+If you already have the LaunchAgent installed, reload it so launchd uses the updated binary:
+
+```bash
+launchctl bootout "gui/$(id -u)/com.awake.agent" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.awake.agent.plist" 2>/dev/null || \
+  launchctl load "$HOME/Library/LaunchAgents/com.awake.agent.plist"
+```
+
+Verify the installed binary:
+
+```bash
+file /usr/local/bin/awake
+/usr/local/bin/awake --help
+```
+
+## Commands
+
+```bash
+awake start [options]
+awake stop
+awake status
+awake setup [options]
+awake install [options]
+awake uninstall
+```
+
+### `start`
+
+Starts the daemon in the foreground.
+
+- creates `/tmp/awake.pid`
+- polls watched processes every 5 seconds
+- starts per-target `caffeinate` children when activity is detected
+- enables `pmset -a disablesleep 1` while at least one target is active
+
+### `stop`
+
+Stops the running daemon identified by `/tmp/awake.pid`.
+
+- kills the daemon
+- releases any active `caffeinate` children
+- attempts to restore the original `SleepDisabled` value
+
+### `status`
+
+Shows:
+
+- whether the daemon is running
+- which watched process names are currently detected
+- the current `pmset` `SleepDisabled` value
+
+### `install`
+
+Writes and loads a LaunchAgent plist at:
+
+```bash
+~/Library/LaunchAgents/com.awake.agent.plist
+```
+
+The LaunchAgent runs:
+
+```bash
+awake start -<flags>
+```
+
+using the currently running executable path.
+
+### `setup`
+
+Performs the normal “install this for daily use” flow:
+
+- installs the binary to `/usr/local/bin/awake`
+- runs the installed binary’s `install` command
+- optionally configures `pmset` privilege for lid-close prevention
+
+### `uninstall`
+
+Unloads and removes the LaunchAgent plist.
+
+## Options
+
+These options apply to `start`, `install`, and `setup`:
+
+- `-D`, `-d`, `--display` — keep the display awake (`caffeinate -d`)
+- `-i`, `--idle-system` — prevent idle system sleep (`caffeinate -i`)
+
+If you provide no options, the default is:
+
+```bash
+caffeinate -di
+```
+
+## Typical usage
+
+Run manually in the foreground:
+
+```bash
+./target/release/awake start
+```
+
+Run manually in the background:
+
+```bash
 ./target/release/awake start &
+```
 
-# Start in display-only mode
-./target/release/awake start -D &
+Display-only mode:
 
-# Check status
+```bash
+./target/release/awake start -D
+```
+
+Check status:
+
+```bash
 ./target/release/awake status
+```
 
-# Stop
+Stop the daemon:
+
+```bash
 ./target/release/awake stop
 ```
 
-`awake start` and `awake install` accept the same options.
-`awake setup` accepts the same flags and passes them through to the installed LaunchAgent.
+Install auto-start at login:
 
-- `-D`, `-d`, `--display` — keep the display awake while a target is active
-- `-i`, `--idle-system` — prevent idle system sleep while a target is active
+```bash
+./target/release/awake install
+```
 
-If no options are provided, the default is `caffeinate -di`.
+## Sleep prevention and permissions
 
-While real work is in progress, `awake` also tries `pmset -a disablesleep 1` alongside `caffeinate -di`. When the work ends or `awake` exits, it restores the original `SleepDisabled` value.
-Two privilege models are supported:
+`awake` uses two layers of sleep prevention:
 
-- If `awake` itself runs as root, it calls `pmset` directly.
-- If it runs as a regular user, it uses `sudo -n pmset ...`.
+1. `caffeinate` for active work assertions
+2. `pmset -a disablesleep` for system sleep / lid-close behavior
 
-If non-interactive `sudo` is not available and `awake` is not running as root, the `pmset` toggle is skipped and only a warning is printed.
+`pmset` is attempted in this order:
 
-### Granting `pmset` permission
+- direct call when `awake` is running as root
+- `sudo -n pmset ...` when running as a normal user
 
-If you answer `y` during `awake setup`, the script installs this sudoers rule for you automatically.
+If passwordless sudo is not available and `awake` is not root, `pmset` is skipped and `awake` prints a warning once.
 
-#### 1. Recommended: allow NOPASSWD for `pmset` only
+### Recommended sudoers rule
 
-Add a sudoers rule like this with `visudo`:
+If you want lid-close sleep prevention without running the whole daemon as root, allow passwordless access to `/usr/bin/pmset` only:
 
 ```sudoers
 your_username ALL=(root) NOPASSWD: /usr/bin/pmset
 ```
 
-This lets `awake` run as a normal user while still allowing `pmset` sleep-prevention commands to run without a password.
+That is the rule `awake setup` can install for you when you answer `y`.
 
-#### 2. Alternative: run `awake` as root
+## LaunchAgent details
+
+The installed LaunchAgent:
+
+- lives at `~/Library/LaunchAgents/com.awake.agent.plist`
+- is configured with `RunAtLoad` and `KeepAlive`
+- writes logs to:
+  - `~/Library/Logs/awake.log`
+  - `~/Library/Logs/awake.err`
+
+## Environment overrides
+
+For advanced setups and testing, these environment variables are supported:
+
+- `AWAKE_INSTALL_PATH` — override the default install path (`/usr/local/bin/awake`)
+- `AWAKE_PMSET_SUDOERS_PATH` — override the default sudoers path (`/etc/sudoers.d/awake-pmset`)
+
+## Troubleshooting
+
+Check whether the daemon is running:
 
 ```bash
-sudo ./target/release/awake start
+awake status
 ```
 
-This is simpler operationally, but it gives root privileges to the entire script rather than just `pmset`.
-
-### LaunchAgent (start automatically at login)
+Check active power assertions:
 
 ```bash
-# Install the LaunchAgent (start automatically at login)
-awake install
-
-# Install the LaunchAgent in display-only mode
-awake install -D
-
-# Remove the LaunchAgent
-awake uninstall
+pmset -g assertions
 ```
 
-## Watched processes
+Inspect `caffeinate` processes directly:
 
-`awake` watches the following process names:
+```bash
+pgrep -a caffeinate
+```
 
-- `claude` — Claude Code CLI
-- `codex` — OpenAI Codex CLI
-- `opencode` — OpenCode CLI
-- `opencode-cli` — OpenCode CLI (alias)
-- `pi` — Pi Coding Agent CLI
+Check the current `SleepDisabled` value:
 
-When a process is detected, `awake` checks for activity signals every 5 seconds. Long-lived **server-style processes** such as `codex app-server` and `opencode serve` / `opencode web` / `opencode acp` are treated as active only when their direct child process count increases. Other CLI processes are treated as active when either their direct child process count increases or their CPU time increases by at least 0.01 seconds. If multiple processes share the same name, `awake` considers the target active when **any one of them** shows an activity signal. While a target is active, `awake` keeps the per-target `caffeinate` process alive and also attempts a global `pmset -a disablesleep 1` toggle when at least one target is active.
-New PIDs are not treated as active just because they appeared. If no activity signal appears for 3 consecutive polls (15 seconds), the target is treated as **idle** and `caffeinate` is released.
-If work resumes, `caffeinate` is activated again automatically.
+```bash
+pmset -g
+```
+
+If `status` says a target is detected but `caffeinate` is not active yet, that can be expected:
+
+- newly seen processes do not immediately count as active
+- server-style processes need child-process activity
+- idle targets are released after 15 seconds without new activity
 
 ## Limitations
 
-Because Codex CLI is Node.js-based, its actual process name may appear as `node`. In that case, `pgrep -x codex` may not detect it. You can add `node` to the `TARGETS` array, but that may also match unrelated Node.js processes.
-
-## How it works
-
-1. `awake start` creates a PID file (`/tmp/awake.pid`) and enters the polling loop.
-2. Every 5 seconds, it checks the `TARGETS` process names with `pgrep -x`.
-3. For each detected process, it measures the direct child process count and `ps -o cputime` values for all matching PIDs.
-4. Server-style processes such as `codex app-server` and `opencode serve` / `opencode web` / `opencode acp` are considered **active** only when their direct child count increases.
-5. Other CLI processes are considered **active** when their direct child count increases or their CPU time increases by at least 0.01 seconds → `awake` starts `caffeinate` with the selected flags (default: `-di`).
-6. If any target is active, `awake` also attempts a global `pmset -a disablesleep 1` toggle (either via root execution or the `sudo -n` path).
-7. If no activity signal is seen for 3 consecutive polls (15 seconds), the target is treated as **idle** → `caffeinate` is released.
-8. When all active targets are gone, `awake` restores `pmset` to the original `SleepDisabled` values for both AC power and battery.
-9. If activity resumes, `caffeinate` / `pmset` are activated again.
-10. When a target process exits, `caffeinate` is released immediately.
-11. On `awake stop` or SIGTERM, `awake` kills all `caffeinate` processes, removes the PID file, and attempts to restore `pmset`.
-
-## Debugging
-
-Use the following commands to check whether `caffeinate` is active:
-
-```bash
-# Show currently active power assertions
-pmset -g assertions
-
-# Check awake status
-awake status
-
-# Inspect caffeinate processes directly
-pgrep -a caffeinate
-
-# Check the current SleepDisabled values
-pmset -g custom | grep disablesleep
-```
-
-If `pmset -g assertions` shows `PreventUserIdleDisplaySleep` or `PreventUserIdleSystemSleep`, `caffeinate` is working as expected.
+- `codex` may appear as `node` depending on how it is launched, so `pgrep -x codex` may miss it
+- activity detection is heuristic-based, not API-integrated
+- `pmset` behavior depends on your permission model and system policy

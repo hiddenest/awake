@@ -90,8 +90,8 @@ fn main() {
 
 fn usage(program: &str) {
     println!(
-        "Usage: {} {{start|stop|status|setup|install|uninstall}} [options]\n\nOptions for start/install/setup:\n  -D, -d, --display      Keep the display awake while a target is active\n  -i, --idle-system      Prevent idle system sleep while a target is active\n\nIf no options are provided, awake uses the default caffeinate flags: -{}",
-        program, DEFAULT_CAFFEINATE_FLAGS
+        "Usage: {} {{start|stop|status|setup|install|uninstall}} [options]\n\nCommands:\n  start [options]       Start the awake daemon in the foreground. The daemon polls for watched AI CLI processes every {} seconds and only keeps the Mac awake while they show real activity.\n  stop                  Stop the running awake daemon and release any active caffeinate/pmset state managed by it.\n  status                Show whether the daemon is running, which watched process names are currently detected, and the current SleepDisabled state reported by pmset.\n  setup [options]       Install or reuse /usr/local/bin/awake, install the LaunchAgent, and optionally configure the pmset sudoers rule for lid-close sleep prevention.\n  install [options]     Write and load the LaunchAgent plist in ~/Library/LaunchAgents so awake starts automatically at login.\n  uninstall             Unload and remove the installed LaunchAgent plist.\n\nOptions for start/install/setup:\n  -D, -d, --display      Keep the display awake while a target is active (caffeinate -d).\n  -i, --idle-system      Prevent idle system sleep while a target is active (caffeinate -i).\n\nBehavior notes:\n  - Watched process names: claude, codex, opencode, opencode-cli, pi\n  - Server-style processes such as codex app-server and opencode serve/web/acp activate on child-process activity, not CPU-only activity\n  - Other CLI processes activate on child-process or CPU-time activity\n  - If no options are provided, awake uses the default caffeinate flags: -{}\n  - setup/install pass the selected flags through to the LaunchAgent configuration",
+        program, POLL_INTERVAL_SECS, DEFAULT_CAFFEINATE_FLAGS
     );
 }
 
