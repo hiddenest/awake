@@ -41,7 +41,7 @@ If macOS enters **system sleep** (for example, lid close) and later wakes, `awak
 - **OpenCode**
   - checks whether the OpenCode GUI app is present, or whether an `opencode` CLI/TUI process is running
   - opens `~/.local/share/opencode/opencode.db` read-only
-  - reads the most recently updated non-archived session from `session`
+  - reads the most recently updated non-archived activity across `session`, `message`, `part`, and `todo`
 
 If the latest provider activity falls outside that 15 second window, the target is treated as idle and its `caffeinate` process is released.
 
