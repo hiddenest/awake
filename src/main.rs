@@ -1,6 +1,5 @@
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::flag;
-use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -13,10 +12,12 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-const TARGETS: [&str; 5] = ["claude", "codex", "opencode", "opencode-cli", "pi"];
+mod session_polling;
+
+use session_polling::{poll_target_session, ACTIVE_SESSION_WINDOW_SECS, TARGETS};
+
 const PID_FILE: &str = "/tmp/awake.pid";
 const DEFAULT_CAFFEINATE_FLAGS: &str = "di";
-const CPU_TIME_DELTA_THRESHOLD_CS: i64 = 1;
 const POLL_INTERVAL_SECS: u64 = 5;
 
 #[derive(Clone)]
@@ -28,10 +29,6 @@ struct AppConfig {
 struct TargetState {
     name: &'static str,
     caffeinate_pid: Option<u32>,
-    proc_pids: Vec<u32>,
-    last_cpu: HashMap<u32, String>,
-    child_baseline: HashMap<u32, u32>,
-    idle_count: u32,
 }
 
 impl TargetState {
@@ -39,10 +36,6 @@ impl TargetState {
         Self {
             name,
             caffeinate_pid: None,
-            proc_pids: Vec::new(),
-            last_cpu: HashMap::new(),
-            child_baseline: HashMap::new(),
-            idle_count: 0,
         }
     }
 }
@@ -90,8 +83,8 @@ fn main() {
 
 fn usage(program: &str) {
     println!(
-        "Usage: {} {{start|stop|status|setup|install|uninstall}} [options]\n\nCommands:\n  start [options]       Start the awake daemon in the foreground. The daemon polls for watched AI CLI processes every {} seconds and only keeps the Mac awake while they show real activity.\n  stop                  Stop the running awake daemon and release any active caffeinate/pmset state managed by it.\n  status                Show whether the daemon is running, which watched process names are currently detected, and the current SleepDisabled state reported by pmset.\n  setup [options]       Install or reuse /usr/local/bin/awake, install the LaunchAgent, and optionally configure the pmset sudoers rule for lid-close sleep prevention.\n  install [options]     Write and load the LaunchAgent plist in ~/Library/LaunchAgents so awake starts automatically at login.\n  uninstall             Unload and remove the installed LaunchAgent plist.\n\nOptions for start/install/setup:\n  -D, -d, --display      Keep the display awake while a target is active (caffeinate -d).\n  -i, --idle-system      Prevent idle system sleep while a target is active (caffeinate -i).\n\nBehavior notes:\n  - Watched process names: claude, codex, opencode, opencode-cli, pi\n  - Server-style processes such as codex app-server and opencode serve/web/acp activate on child-process activity, not CPU-only activity\n  - Other CLI processes activate on child-process or CPU-time activity\n  - If no options are provided, awake uses the default caffeinate flags: -{}\n  - setup/install pass the selected flags through to the LaunchAgent configuration",
-        program, POLL_INTERVAL_SECS, DEFAULT_CAFFEINATE_FLAGS
+        "Usage: {} {{start|stop|status|setup|install|uninstall}} [options]\n\nCommands:\n  start [options]       Start the awake daemon in the foreground. The daemon polls GUI-backed session state every {} seconds and only keeps the Mac awake while a real session is actively progressing.\n  stop                  Stop the running awake daemon and release any active caffeinate/pmset state managed by it.\n  status                Show whether the daemon is running, the current session state for Claude Code, Codex, and OpenCode, and the current SleepDisabled state reported by pmset.\n  setup [options]       Install or reuse /usr/local/bin/awake, install the LaunchAgent, and optionally configure the pmset sudoers rule for lid-close sleep prevention.\n  install [options]     Write and load the LaunchAgent plist in ~/Library/LaunchAgents so awake starts automatically at login.\n  uninstall             Unload and remove the installed LaunchAgent plist.\n\nOptions for start/install/setup:\n  -D, -d, --display      Keep the display awake while a session is active (caffeinate -d).\n  -i, --idle-system      Prevent idle system sleep while a session is active (caffeinate -i).\n\nBehavior notes:\n  - Session providers: claude-code, codex, opencode\n  - OpenCode is treated as active only when the OpenCode GUI process exists and its session database shows a recent update\n  - Codex is treated as active when the Codex desktop/runtime is present and its thread state shows a recent update\n  - Claude Code is treated as active when its transcript/session files are still being updated\n  - A session update is considered active for up to {} seconds after its latest observed activity\n  - If no options are provided, awake uses the default caffeinate flags: -{}\n  - setup/install pass the selected flags through to the LaunchAgent configuration",
+        program, POLL_INTERVAL_SECS, ACTIVE_SESSION_WINDOW_SECS, DEFAULT_CAFFEINATE_FLAGS
     );
 }
 
@@ -148,90 +141,37 @@ fn cmd_start(config: &AppConfig, raw_args: &[String]) {
 
     while !terminate.load(Ordering::Relaxed) {
         for target in &mut state.targets {
-            let pids = pgrep_exact(target.name);
+            let poll = poll_target_session(target.name);
+            let caffeinate_alive = target.caffeinate_pid.map(process_alive).unwrap_or(false);
 
-            if !pids.is_empty() {
-                retain_pid_state(target, &pids);
-                target.proc_pids = pids.clone();
-
-                let mut target_active = false;
-                let mut active_pid: Option<u32> = None;
-                let mut saw_new_pid = false;
-
-                for pid in pids.iter().copied() {
-                    if !target.child_baseline.contains_key(&pid) {
-                        let initial_children = count_direct_children(pid).unwrap_or(0);
-                        target
-                            .last_cpu
-                            .insert(pid, get_cpu_time(pid).unwrap_or_default());
-                        target.child_baseline.insert(pid, initial_children);
-                        saw_new_pid = true;
-
-                        if should_activate_on_initial_server_children(target.name, pid)
-                            && initial_children > 0
-                        {
-                            target_active = true;
-                            active_pid = Some(pid);
-                            break;
+            if poll.active {
+                if !caffeinate_alive {
+                    match Command::new("caffeinate")
+                        .arg(format!("-{}", state.caffeinate_flags))
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                    {
+                        Ok(child) => {
+                            target.caffeinate_pid = Some(child.id());
+                            println!(
+                                "[awake] {} session active — caffeinate -{} started ({})",
+                                target.name, state.caffeinate_flags, poll.detail
+                            );
                         }
-                    } else if is_pid_active(target, pid) {
-                        target_active = true;
-                        active_pid = Some(pid);
-                        break;
-                    }
-                }
-
-                if target_active {
-                    target.idle_count = 0;
-                } else if saw_new_pid {
-                    target.idle_count = 3;
-                } else {
-                    target.idle_count += 1;
-                }
-
-                let caffeinate_alive = target.caffeinate_pid.map(process_alive).unwrap_or(false);
-
-                if target.idle_count < 3 {
-                    if !caffeinate_alive {
-                        match Command::new("caffeinate")
-                            .arg(format!("-{}", state.caffeinate_flags))
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .spawn()
-                        {
-                            Ok(child) => {
-                                target.caffeinate_pid = Some(child.id());
-                                let report_pid =
-                                    active_pid.or_else(|| pids.first().copied()).unwrap_or(0);
-                                println!(
-                                    "[awake] {} (PID {}) is active — caffeinate -{} started",
-                                    target.name, report_pid, state.caffeinate_flags
-                                );
-                            }
-                            Err(err) => {
-                                eprintln!(
-                                    "[awake] Failed to start caffeinate for {}: {}",
-                                    target.name, err
-                                );
-                            }
+                        Err(err) => {
+                            eprintln!(
+                                "[awake] Failed to start caffeinate for {}: {}",
+                                target.name, err
+                            );
                         }
                     }
-                } else if let Some(caff_pid) = target.caffeinate_pid.take() {
-                    kill_process(caff_pid);
-                    println!("[awake] {} idle — caffeinate released", target.name);
                 }
-            } else if !target.proc_pids.is_empty() {
-                if let Some(caff_pid) = target.caffeinate_pid.take() {
-                    kill_process(caff_pid);
-                }
-                let old_pid = join_pids(&target.proc_pids);
-                target.proc_pids.clear();
-                target.last_cpu.clear();
-                target.child_baseline.clear();
-                target.idle_count = 0;
+            } else if let Some(caff_pid) = target.caffeinate_pid.take() {
+                kill_process(caff_pid);
                 println!(
-                    "[awake] {} (PID {}) exited — caffeinate released",
-                    target.name, old_pid
+                    "[awake] {} idle — caffeinate released ({})",
+                    target.name, poll.detail
                 );
             }
         }
@@ -306,20 +246,13 @@ fn cmd_status() {
     println!("[awake] Status: running (PID {})", pid);
 
     for name in TARGETS {
-        let pids = pgrep_exact(name);
-        if pids.is_empty() {
-            println!("[awake]   {}: not detected", name);
-        } else {
-            println!(
-                "[awake]   {}: detected (PIDs {}) — checking activity",
-                name,
-                join_pids(&pids)
-            );
-        }
+        let poll = poll_target_session(name);
+        println!("[awake]   {}: {}", name, poll.detail);
     }
 
     println!(
-        "[awake]   caffeinate: active only when target shows child-process or CPU-time activity (15s grace window)"
+        "[awake]   caffeinate: active only while a polled session shows recent activity ({}s window)",
+        ACTIVE_SESSION_WINDOW_SECS
     );
     println!(
         "[awake]   pmset SleepDisabled: {}",
@@ -528,194 +461,6 @@ fn parse_caffeinate_flags(args: &[String]) -> ParseFlagsResult {
 fn append_caffeinate_flag(flags: &mut String, flag: char) {
     if !flags.contains(flag) {
         flags.push(flag);
-    }
-}
-
-fn retain_pid_state(target: &mut TargetState, pids: &[u32]) {
-    let live: HashSet<u32> = pids.iter().copied().collect();
-    target.last_cpu.retain(|pid, _| live.contains(pid));
-    target.child_baseline.retain(|pid, _| live.contains(pid));
-}
-
-fn is_pid_active(target: &mut TargetState, pid: u32) -> bool {
-    let cur_cpu = match get_cpu_time(pid) {
-        Some(value) => value,
-        None => return false,
-    };
-
-    let last_cpu = target.last_cpu.get(&pid).cloned();
-    let baseline = *target.child_baseline.get(&pid).unwrap_or(&0);
-    let child_count = count_direct_children(pid).unwrap_or(0);
-    let cur_cpu_cs = cpu_time_to_centiseconds(&cur_cpu);
-
-    if child_count > baseline {
-        target.last_cpu.insert(pid, cur_cpu);
-        return true;
-    }
-
-    if is_server_process(target.name, pid) {
-        target.last_cpu.insert(pid, cur_cpu);
-        return false;
-    }
-
-    let cpu_delta_cs = last_cpu
-        .as_deref()
-        .map(cpu_time_to_centiseconds)
-        .map(|last| cur_cpu_cs - last)
-        .unwrap_or(0);
-
-    target.last_cpu.insert(pid, cur_cpu);
-    last_cpu.is_some() && cpu_delta_cs >= CPU_TIME_DELTA_THRESHOLD_CS
-}
-
-fn pgrep_exact(name: &str) -> Vec<u32> {
-    command_output("pgrep", &["-x", name])
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| line.trim().parse::<u32>().ok())
-        .collect()
-}
-
-fn count_direct_children(pid: u32) -> Option<u32> {
-    let output = command_output("ps", &["-axo", "ppid="]).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let mut count = 0;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if line.trim() == pid.to_string() {
-            count += 1;
-        }
-    }
-    Some(count)
-}
-
-fn get_cpu_time(pid: u32) -> Option<String> {
-    let output = command_output("ps", &["-p", &pid.to_string(), "-o", "cputime="]).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let cpu = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .replace(' ', "");
-    if cpu.is_empty() {
-        None
-    } else {
-        Some(cpu)
-    }
-}
-
-fn get_process_args(pid: u32) -> Option<String> {
-    let output = command_output("ps", &["-p", &pid.to_string(), "-o", "args="]).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let args = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if args.is_empty() {
-        None
-    } else {
-        Some(args)
-    }
-}
-
-fn get_opencode_subcommand(pid: u32) -> Option<String> {
-    let args = get_process_args(pid)?;
-
-    if args.contains(" --prompt ") || args.contains(" --title ") {
-        let mut tokens = args.split_whitespace();
-        let _ = tokens.next();
-        for token in tokens {
-            if matches!(token, "run" | "attach" | "pr") {
-                return Some(token.to_string());
-            }
-        }
-        return None;
-    }
-
-    let tokens: Vec<&str> = args.split_whitespace().collect();
-    if tokens.len() <= 1 {
-        return None;
-    }
-
-    let mut idx = 1;
-    while idx < tokens.len() {
-        let token = tokens[idx];
-        match token {
-            "--log-level" | "--port" | "--hostname" | "--mdns-domain" | "--attach"
-            | "--password" | "-p" | "--dir" | "--model" | "--agent" | "--format" | "--title"
-            | "--variant" | "-s" | "--session" | "-c" | "--command" | "-m" | "-f" | "--file" => {
-                idx += 2;
-                continue;
-            }
-            _ if token.starts_with("--") && token.contains('=') => {
-                idx += 1;
-                continue;
-            }
-            "--print-logs" | "--mdns" | "--fork" | "--share" | "--thinking" | "--continue"
-            | "-h" | "--help" | "-v" | "--version" => {
-                idx += 1;
-                continue;
-            }
-            "serve" | "web" | "acp" | "run" | "attach" | "pr" => {
-                return Some(token.to_string());
-            }
-            _ if token.starts_with('-') => {
-                if let Some(next) = tokens.get(idx + 1) {
-                    if !matches!(*next, "serve" | "web" | "acp" | "run" | "attach" | "pr")
-                        && !next.starts_with('-')
-                    {
-                        idx += 2;
-                        continue;
-                    }
-                }
-                idx += 1;
-            }
-            _ => return None,
-        }
-    }
-
-    None
-}
-
-fn is_server_process(name: &str, pid: u32) -> bool {
-    let args = get_process_args(pid).unwrap_or_default();
-    match name {
-        "codex" => args.contains(" app-server") || args.ends_with(" app-server"),
-        "opencode" | "opencode-cli" => matches!(
-            get_opencode_subcommand(pid).as_deref(),
-            Some("serve") | Some("web") | Some("acp")
-        ),
-        _ => false,
-    }
-}
-
-fn should_activate_on_initial_server_children(name: &str, pid: u32) -> bool {
-    match name {
-        "codex" => is_server_process(name, pid),
-        _ => false,
-    }
-}
-
-fn cpu_time_to_centiseconds(value: &str) -> i64 {
-    let mut main_and_fraction = value.split('.');
-    let main = main_and_fraction.next().unwrap_or_default();
-    let fraction = main_and_fraction.next().unwrap_or("0");
-    let parts: Vec<i64> = main
-        .split(':')
-        .filter_map(|part| part.parse::<i64>().ok())
-        .collect();
-
-    let centiseconds = fraction.parse::<i64>().unwrap_or(0);
-    match parts.as_slice() {
-        [minutes, seconds] => ((*minutes * 60) + *seconds) * 100 + centiseconds,
-        [hours, minutes, seconds] => {
-            (((*hours * 60) + *minutes) * 60 + *seconds) * 100 + centiseconds
-        }
-        _ => 0,
     }
 }
 
@@ -984,13 +729,6 @@ fn kill_process(pid: u32) {
         .status();
 }
 
-fn join_pids(pids: &[u32]) -> String {
-    pids.iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn command_success(program: &str, args: &[&str]) -> bool {
     Command::new(program)
         .args(args)
@@ -1119,31 +857,18 @@ mod tests {
     }
 
     #[test]
-    fn cpu_time_to_centiseconds_handles_mm_ss_fraction() {
-        assert_eq!(cpu_time_to_centiseconds("01:02.03"), 6203);
+    fn target_set_matches_session_polling_contract() {
+        assert_eq!(TARGETS, ["claude-code", "codex", "opencode"]);
     }
 
     #[test]
-    fn cpu_time_to_centiseconds_handles_hh_mm_ss_fraction() {
-        assert_eq!(cpu_time_to_centiseconds("01:02:03.04"), 372304);
-    }
-
-    #[test]
-    fn cpu_time_to_centiseconds_handles_mm_ss_without_fraction() {
-        assert_eq!(cpu_time_to_centiseconds("02:03"), 12300);
-    }
-
-    #[test]
-    fn target_set_matches_original_bash_contract() {
-        assert_eq!(
-            TARGETS,
-            ["claude", "codex", "opencode", "opencode-cli", "pi"]
-        );
-    }
-
-    #[test]
-    fn poll_interval_matches_original_bash_contract() {
+    fn poll_interval_matches_existing_contract() {
         assert_eq!(POLL_INTERVAL_SECS, 5);
+    }
+
+    #[test]
+    fn active_window_uses_three_polls() {
+        assert_eq!(ACTIVE_SESSION_WINDOW_SECS, 15);
     }
 
     #[test]
@@ -1177,4 +902,5 @@ mod tests {
             None
         );
     }
+
 }
