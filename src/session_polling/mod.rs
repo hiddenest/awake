@@ -152,6 +152,12 @@ fn gui_app_running(app_name: &str) -> bool {
         .any(|line| line.contains(&format!("\"{}\"", app_name)))
 }
 
+fn process_running(process_name: &str) -> bool {
+    crate::command_output("pgrep", &["-x", process_name])
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 fn age_from_epoch_secs(value: Option<u64>) -> Option<u64> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
     let value = value?;

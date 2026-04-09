@@ -1,12 +1,15 @@
 use super::{
-    age_from_epoch_millis, gui_app_running, gui_runtime_detail, home_dir, sqlite_single_line,
+    age_from_epoch_millis, gui_app_running, home_dir, process_running, sqlite_single_line,
     SessionPollResult, ACTIVE_SESSION_WINDOW_SECS,
 };
 
 const OPENCODE_GUI_APP_NAME: &str = "OpenCode";
+const OPENCODE_CLI_PROCESS_NAME: &str = "opencode";
 
 pub(super) fn poll_session() -> SessionPollResult {
     let gui_present = gui_app_running(OPENCODE_GUI_APP_NAME);
+    let cli_present = process_running(OPENCODE_CLI_PROCESS_NAME);
+    let runtime_present = gui_present || cli_present;
     let db_path = home_dir().join(".local/share/opencode/opencode.db");
     let query = "select id,title,time_updated,directory from session where time_archived is null order by time_updated desc limit 1;";
 
@@ -25,21 +28,20 @@ pub(super) fn poll_session() -> SessionPollResult {
             let directory = parts[3];
 
             if let Some(age_secs) = age_from_epoch_millis(updated_at) {
-                if gui_present && age_secs <= ACTIVE_SESSION_WINDOW_SECS {
+                if runtime_present && age_secs <= ACTIVE_SESSION_WINDOW_SECS {
                     return SessionPollResult {
                         active: true,
                         detail: format!(
-                            "active OpenCode GUI session in {} updated {}s ago ({})",
-                            directory, age_secs, title
+                            "active OpenCode {} session in {} updated {}s ago ({})",
+                            runtime_detail(gui_present, cli_present),
+                            directory,
+                            age_secs,
+                            title
                         ),
                     };
                 }
 
-                let runtime = if gui_present {
-                    "GUI process present"
-                } else {
-                    "no OpenCode GUI process"
-                };
+                let runtime = runtime_presence_detail(gui_present, cli_present);
                 return SessionPollResult {
                     active: false,
                     detail: format!(
@@ -58,8 +60,26 @@ pub(super) fn poll_session() -> SessionPollResult {
             active: false,
             detail: format!(
                 "idle — no OpenCode session state found ({})",
-                gui_runtime_detail(gui_present, OPENCODE_GUI_APP_NAME)
+                runtime_presence_detail(gui_present, cli_present)
             ),
         },
+    }
+}
+
+fn runtime_detail(gui_present: bool, cli_present: bool) -> &'static str {
+    match (gui_present, cli_present) {
+        (true, true) => "GUI/CLI",
+        (true, false) => "GUI",
+        (false, true) => "CLI",
+        (false, false) => "runtime",
+    }
+}
+
+fn runtime_presence_detail(gui_present: bool, cli_present: bool) -> &'static str {
+    match (gui_present, cli_present) {
+        (true, true) => "GUI + CLI process present",
+        (true, false) => "GUI process present",
+        (false, true) => "CLI process present",
+        (false, false) => "no OpenCode GUI or CLI process",
     }
 }
