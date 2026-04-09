@@ -1,6 +1,6 @@
 use super::{
     claude_ide_lock_active, claude_runtime_detail, gui_app_running, home_dir, newest_file_age_secs,
-    SessionPollResult, ACTIVE_SESSION_WINDOW_SECS,
+    SessionPollResult,
 };
 
 const CLAUDE_GUI_APP_NAME: &str = "Claude";
@@ -11,20 +11,16 @@ pub(super) fn poll_session() -> SessionPollResult {
     let transcript_dir = home_dir().join(".claude/transcripts");
 
     match newest_file_age_secs(&transcript_dir) {
-        Some((path, age_secs))
-            if (gui_present || ide_lock_present) && age_secs <= ACTIVE_SESSION_WINDOW_SECS =>
-        {
-            SessionPollResult {
-                active: true,
-                detail: format!(
-                    "active session transcript {} updated {}s ago",
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("unknown"),
-                    age_secs
-                ),
-            }
-        }
+        Some((path, age_secs)) if gui_present || ide_lock_present => SessionPollResult {
+            active: true,
+            detail: format!(
+                "active session transcript {} present (last update {}s ago)",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unknown"),
+                age_secs
+            ),
+        },
         Some((path, age_secs)) => SessionPollResult {
             active: false,
             detail: format!(

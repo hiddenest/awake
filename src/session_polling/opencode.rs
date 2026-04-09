@@ -1,6 +1,6 @@
 use super::{
     age_from_epoch_millis, gui_app_running, home_dir, process_running, sqlite_single_line,
-    SessionPollResult, ACTIVE_SESSION_WINDOW_SECS,
+    SessionPollResult,
 };
 
 const OPENCODE_GUI_APP_NAME: &str = "OpenCode";
@@ -23,11 +23,11 @@ pub(super) fn poll_session() -> SessionPollResult {
             };
 
             if let Some(age_secs) = age_from_epoch_millis(Some(activity.updated_at)) {
-                if runtime_present && age_secs <= ACTIVE_SESSION_WINDOW_SECS {
+                if runtime_present {
                     return SessionPollResult {
                         active: true,
                         detail: format!(
-                            "active OpenCode {} activity in {} updated {}s ago ({})",
+                            "active OpenCode {} session in {} present (last update {}s ago) ({})",
                             runtime_detail(gui_present, cli_present),
                             activity.directory,
                             age_secs,
