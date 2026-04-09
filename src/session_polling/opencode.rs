@@ -1,6 +1,6 @@
 use super::{
-    age_from_epoch_millis, gui_app_running, home_dir, process_running, sqlite_single_line,
-    SessionPollResult,
+    activity_within_window, age_from_epoch_millis, gui_app_running, home_dir,
+    process_command_lines, sqlite_single_line, SessionPollResult,
 };
 
 const OPENCODE_GUI_APP_NAME: &str = "OpenCode";
@@ -9,7 +9,7 @@ const OPENCODE_ACTIVITY_QUERY: &str = "select s.id,s.title,s.directory,max(s.tim
 
 pub(super) fn poll_session() -> SessionPollResult {
     let gui_present = gui_app_running(OPENCODE_GUI_APP_NAME);
-    let cli_present = process_running(OPENCODE_CLI_PROCESS_NAME);
+    let cli_present = opencode_cli_session_running();
     let runtime_present = gui_present || cli_present;
     let db_path = home_dir().join(".local/share/opencode/opencode.db");
 
@@ -23,7 +23,7 @@ pub(super) fn poll_session() -> SessionPollResult {
             };
 
             if let Some(age_secs) = age_from_epoch_millis(Some(activity.updated_at)) {
-                if runtime_present {
+                if runtime_present && activity_within_window(age_secs) {
                     return SessionPollResult {
                         active: true,
                         detail: format!(
@@ -91,11 +91,75 @@ fn runtime_detail(gui_present: bool, cli_present: bool) -> &'static str {
 
 fn runtime_presence_detail(gui_present: bool, cli_present: bool) -> &'static str {
     match (gui_present, cli_present) {
-        (true, true) => "GUI + CLI process present",
+        (true, true) => "GUI + CLI session present",
         (true, false) => "GUI process present",
-        (false, true) => "CLI process present",
-        (false, false) => "no OpenCode GUI or CLI process",
+        (false, true) => "CLI session present",
+        (false, false) => "no OpenCode GUI or CLI session",
     }
+}
+
+fn opencode_cli_session_running() -> bool {
+    process_command_lines(OPENCODE_CLI_PROCESS_NAME)
+        .into_iter()
+        .filter_map(|line| detect_opencode_subcommand_from_args(&line))
+        .any(|subcommand| matches!(subcommand.as_str(), "run" | "attach" | "pr"))
+}
+
+fn detect_opencode_subcommand_from_args(args: &str) -> Option<String> {
+    if args.contains(" --prompt ") || args.contains(" --title ") {
+        let mut tokens = args.split_whitespace();
+        let _ = tokens.next();
+        for token in tokens {
+            if matches!(token, "run" | "attach" | "pr") {
+                return Some(token.to_string());
+            }
+        }
+        return None;
+    }
+
+    let tokens: Vec<&str> = args.split_whitespace().collect();
+    if tokens.len() <= 1 {
+        return None;
+    }
+
+    let mut idx = 1;
+    while idx < tokens.len() {
+        let token = tokens[idx];
+        match token {
+            "--log-level" | "--port" | "--hostname" | "--mdns-domain" | "--attach"
+            | "--password" | "-p" | "--dir" | "--model" | "--agent" | "--format" | "--title"
+            | "--variant" | "-s" | "--session" | "-c" | "--command" | "-m" | "-f" | "--file" => {
+                idx += 2;
+                continue;
+            }
+            _ if token.starts_with("--") && token.contains('=') => {
+                idx += 1;
+                continue;
+            }
+            "--print-logs" | "--mdns" | "--fork" | "--share" | "--thinking" | "--continue"
+            | "-h" | "--help" | "-v" | "--version" => {
+                idx += 1;
+                continue;
+            }
+            "serve" | "web" | "acp" | "run" | "attach" | "pr" => {
+                return Some(token.to_string());
+            }
+            _ if token.starts_with('-') => {
+                if let Some(next) = tokens.get(idx + 1) {
+                    if !matches!(*next, "serve" | "web" | "acp" | "run" | "attach" | "pr")
+                        && !next.starts_with('-')
+                    {
+                        idx += 2;
+                        continue;
+                    }
+                }
+                idx += 1;
+            }
+            _ => return None,
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -114,5 +178,37 @@ mod tests {
     #[test]
     fn parse_activity_row_rejects_missing_timestamp() {
         assert!(parse_activity_row("ses_123|title|/tmp/project").is_none());
+    }
+
+    #[test]
+    fn opencode_parser_detects_run_after_prompt_fast_path() {
+        assert_eq!(
+            detect_opencode_subcommand_from_args("opencode --prompt hello run"),
+            Some("run".to_string())
+        );
+    }
+
+    #[test]
+    fn opencode_parser_detects_server_subcommand() {
+        assert_eq!(
+            detect_opencode_subcommand_from_args("opencode --port 1234 serve"),
+            Some("serve".to_string())
+        );
+    }
+
+    #[test]
+    fn opencode_parser_skips_continue_flag_before_subcommand() {
+        assert_eq!(
+            detect_opencode_subcommand_from_args("opencode --continue run"),
+            Some("run".to_string())
+        );
+    }
+
+    #[test]
+    fn opencode_parser_skips_continue_flag_without_eating_following_value() {
+        assert_eq!(
+            detect_opencode_subcommand_from_args("opencode --continue session-123 run"),
+            None
+        );
     }
 }

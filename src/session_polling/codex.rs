@@ -1,6 +1,6 @@
 use super::{
-    age_from_epoch_secs, gui_app_running, gui_runtime_detail, home_dir, newest_matching_file,
-    sqlite_single_line, SessionPollResult,
+    activity_within_window, age_from_epoch_secs, gui_app_running, gui_runtime_detail, home_dir,
+    newest_matching_file, sqlite_single_line, SessionPollResult,
 };
 
 const CODEX_GUI_APP_NAME: &str = "Codex";
@@ -37,7 +37,7 @@ pub(super) fn poll_session() -> SessionPollResult {
             let title = parts[4];
 
             if let Some(age_secs) = age_from_epoch_secs(updated_at) {
-                if gui_present {
+                if gui_present && activity_within_window(age_secs) {
                     return SessionPollResult {
                         active: true,
                         detail: format!(

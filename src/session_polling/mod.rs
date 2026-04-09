@@ -152,10 +152,26 @@ fn gui_app_running(app_name: &str) -> bool {
         .any(|line| line.contains(&format!("\"{}\"", app_name)))
 }
 
-fn process_running(process_name: &str) -> bool {
-    crate::command_output("pgrep", &["-x", process_name])
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+fn process_command_lines(process_name: &str) -> Vec<String> {
+    let output = match crate::command_output("ps", &["axww", "-o", "command="]) {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            let executable = line.split_whitespace().next().unwrap_or("");
+            executable == process_name || executable.rsplit('/').next() == Some(process_name)
+        })
+        .map(|line| line.to_string())
+        .collect()
+}
+
+fn activity_within_window(age_secs: u64) -> bool {
+    age_secs <= ACTIVE_SESSION_WINDOW_SECS
 }
 
 fn age_from_epoch_secs(value: Option<u64>) -> Option<u64> {
@@ -226,5 +242,15 @@ mod tests {
         let _ = fs::remove_file(older);
         let _ = fs::remove_file(newer);
         let _ = fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn activity_within_window_accepts_recent_updates() {
+        assert!(activity_within_window(ACTIVE_SESSION_WINDOW_SECS));
+    }
+
+    #[test]
+    fn activity_within_window_rejects_stale_updates() {
+        assert!(!activity_within_window(ACTIVE_SESSION_WINDOW_SECS + 1));
     }
 }

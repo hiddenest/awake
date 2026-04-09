@@ -39,7 +39,7 @@ If macOS enters **system sleep** (for example, lid close) and later wakes, `awak
   - treats the newest non-archived thread from `threads` as active while the GUI runtime is present
 
 - **OpenCode**
-  - checks whether the OpenCode GUI app is present, or whether an `opencode` CLI/TUI process is running
+  - checks whether the OpenCode GUI app is present, or whether an `opencode` CLI session is running with a real interactive subcommand such as `run`, `attach`, or `pr`
   - opens `~/.local/share/opencode/opencode.db` read-only
   - treats the newest non-archived activity across `session`, `message`, `part`, and `todo` as active while the runtime is present
 

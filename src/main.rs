@@ -57,6 +57,11 @@ enum ParseFlagsResult {
     Err,
 }
 
+enum DaemonStatus {
+    PidFile(u32),
+    Orphan(u32),
+}
+
 fn main() {
     let config = AppConfig {
         system_install_path: PathBuf::from(
@@ -85,7 +90,7 @@ fn main() {
 
 fn usage(program: &str) {
     println!(
-        "Usage: {} {{start|stop|status|setup|install|uninstall}} [options]\n\nCommands:\n  start [options]       Start the awake daemon in the foreground. The daemon polls GUI-backed session state every {} seconds and only keeps the Mac awake while a real session is actively progressing.\n  stop                  Stop the running awake daemon and release any active caffeinate/pmset state managed by it.\n  status                Show whether the daemon is running, the current session state for Claude Code, Codex, and OpenCode, and the current SleepDisabled state reported by pmset.\n  setup [options]       Install or reuse /usr/local/bin/awake, install the LaunchAgent, and optionally configure the pmset sudoers rule for lid-close sleep prevention.\n  install [options]     Write and load the LaunchAgent plist in ~/Library/LaunchAgents so awake starts automatically at login.\n  uninstall             Unload and remove the installed LaunchAgent plist.\n\nOptions for start/install/setup:\n  -D, -d, --display      Keep the display awake while a session is active (caffeinate -d).\n  -i, --idle-system      Prevent idle system sleep while a session is active (caffeinate -i).\n\nBehavior notes:\n  - Session providers: claude-code, codex, opencode\n  - OpenCode is treated as active only when the OpenCode GUI process exists and its session database shows a recent update\n  - Codex is treated as active when the Codex desktop/runtime is present and its thread state shows a recent update\n  - Claude Code is treated as active when its transcript/session files are still being updated\n  - A session update is considered active for up to {} seconds after its latest observed activity\n  - If no options are provided, awake uses the default caffeinate flags: -{}\n  - setup/install pass the selected flags through to the LaunchAgent configuration",
+        "Usage: {} {{start|stop|status|setup|install|uninstall}} [options]\n\nCommands:\n  start [options]       Start the awake daemon in the foreground. The daemon polls GUI-backed session state every {} seconds and only keeps the Mac awake while a real session is actively progressing.\n  stop                  Stop the running awake daemon and release any active caffeinate/pmset state managed by it.\n  status                Show whether the daemon is running, the current session state for Claude Code, Codex, and OpenCode, and the current SleepDisabled state reported by pmset.\n  setup [options]       Install or reuse /usr/local/bin/awake, install the LaunchAgent, and optionally configure the pmset sudoers rule for lid-close sleep prevention.\n  install [options]     Write and load the LaunchAgent plist in ~/Library/LaunchAgents so awake starts automatically at login.\n  uninstall             Unload and remove the installed LaunchAgent plist.\n\nOptions for start/install/setup:\n  -D, -d, --display      Keep the display awake while a session is active (caffeinate -d).\n  -i, --idle-system      Prevent idle system sleep while a session is active (caffeinate -i).\n\nBehavior notes:\n  - Session providers: claude-code, codex, opencode\n  - OpenCode is treated as active only when the OpenCode GUI process or a real CLI session is present and its session database shows a recent update\n  - Codex is treated as active when the Codex desktop/runtime is present and its thread state shows a recent update\n  - Claude Code is treated as active when its transcript/session files are still being updated\n  - A session update is considered active for up to {} seconds after its latest observed activity\n  - If no options are provided, awake uses the default caffeinate flags: -{}\n  - setup/install pass the selected flags through to the LaunchAgent configuration",
         program, POLL_INTERVAL_SECS, ACTIVE_SESSION_WINDOW_SECS, DEFAULT_CAFFEINATE_FLAGS
     );
 }
@@ -104,8 +109,16 @@ fn cmd_start(config: &AppConfig, raw_args: &[String]) {
                 eprintln!("[awake] Already running (PID {})", existing_pid);
                 process::exit(1);
             }
-            Some(_) | None => println!("[awake] Removing stale PID file"),
+            Some(_) | None => {
+                println!("[awake] Removing stale PID file");
+                let _ = fs::remove_file(pid_file);
+            }
         }
+    }
+
+    if let Some(pid) = find_running_awake_daemon(Some(process::id())) {
+        eprintln!("[awake] Already running (PID {}, no PID file present)", pid);
+        process::exit(1);
     }
 
     if let Err(err) = fs::write(pid_file, format!("{}\n", process::id())) {
@@ -219,52 +232,35 @@ fn cmd_start(config: &AppConfig, raw_args: &[String]) {
 }
 
 fn cmd_stop() {
-    let pid_file = Path::new(PID_FILE);
-    if !pid_file.exists() {
-        println!("[awake] Not running");
-        process::exit(1);
-    }
-
-    let pid = match read_pid_file(pid_file) {
-        Some(pid) => pid,
+    match daemon_status() {
+        Some(DaemonStatus::PidFile(pid)) => {
+            kill_process(pid);
+            println!("[awake] Stopped (PID {})", pid);
+        }
+        Some(DaemonStatus::Orphan(pid)) => {
+            kill_process(pid);
+            println!("[awake] Stopped orphaned daemon (PID {})", pid);
+        }
         None => {
-            println!("[awake] Not running (stale PID file)");
-            let _ = fs::remove_file(pid_file);
+            println!("[awake] Not running");
             process::exit(1);
         }
-    };
-
-    if process_alive(pid) {
-        kill_process(pid);
-        println!("[awake] Stopped (PID {})", pid);
-    } else {
-        println!("[awake] Not running (stale PID file)");
-        let _ = fs::remove_file(pid_file);
-        process::exit(1);
     }
 }
 
 fn cmd_status() {
-    let pid_file = Path::new(PID_FILE);
-    if !pid_file.exists() {
-        println!("[awake] Status: stopped");
-        return;
-    }
-
-    let pid = match read_pid_file(pid_file) {
-        Some(pid) => pid,
+    match daemon_status() {
+        Some(DaemonStatus::PidFile(pid)) => {
+            println!("[awake] Status: running (PID {})", pid);
+        }
+        Some(DaemonStatus::Orphan(pid)) => {
+            println!("[awake] Status: running (PID {}, no PID file)", pid);
+        }
         None => {
-            println!("[awake] Status: stopped (stale PID file)");
+            println!("[awake] Status: stopped");
             return;
         }
-    };
-
-    if !process_alive(pid) {
-        println!("[awake] Status: stopped (stale PID file)");
-        return;
     }
-
-    println!("[awake] Status: running (PID {})", pid);
 
     for name in TARGETS {
         let poll = poll_target_session(name);
@@ -612,6 +608,20 @@ fn read_pid_file(path: &Path) -> Option<u32> {
         .and_then(|value| value.trim().parse::<u32>().ok())
 }
 
+fn daemon_status() -> Option<DaemonStatus> {
+    let pid_file = Path::new(PID_FILE);
+    if pid_file.exists() {
+        match read_pid_file(pid_file) {
+            Some(pid) if process_alive(pid) => return Some(DaemonStatus::PidFile(pid)),
+            Some(_) | None => {
+                let _ = fs::remove_file(pid_file);
+            }
+        }
+    }
+
+    find_running_awake_daemon(Some(process::id())).map(DaemonStatus::Orphan)
+}
+
 fn remove_pid_file_for_process(expected_pid: u32) {
     let path = Path::new(PID_FILE);
     match read_pid_file(path) {
@@ -620,6 +630,35 @@ fn remove_pid_file_for_process(expected_pid: u32) {
         }
         _ => {}
     }
+}
+
+fn find_running_awake_daemon(exclude_pid: Option<u32>) -> Option<u32> {
+    let output = command_output("ps", &["axww", "-o", "pid=,command="]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(parse_process_line)
+        .find(|(pid, command)| {
+            Some(*pid) != exclude_pid && detect_awake_start_command(command) && process_alive(*pid)
+        })
+        .map(|(pid, _)| pid)
+}
+
+fn parse_process_line(line: &str) -> Option<(u32, &str)> {
+    let trimmed = line.trim();
+    let split_at = trimmed.find(char::is_whitespace)?;
+    let (pid, command) = trimmed.split_at(split_at);
+    Some((pid.parse().ok()?, command.trim_start()))
+}
+
+fn detect_awake_start_command(command: &str) -> bool {
+    let mut tokens = command.split_whitespace();
+    let executable = tokens.next().unwrap_or("");
+    let executable = executable.rsplit('/').next().unwrap_or(executable);
+    executable == "awake" && matches!(tokens.next(), Some("start"))
 }
 
 fn install_script_systemwide(config: &AppConfig) -> Result<(), String> {
@@ -855,64 +894,6 @@ mod tests {
         parse_caffeinate_flags(&owned)
     }
 
-    fn detect_opencode_subcommand_from_args(args: &str) -> Option<String> {
-        if args.contains(" --prompt ") || args.contains(" --title ") {
-            let mut tokens = args.split_whitespace();
-            let _ = tokens.next();
-            for token in tokens {
-                if matches!(token, "run" | "attach" | "pr") {
-                    return Some(token.to_string());
-                }
-            }
-            return None;
-        }
-
-        let tokens: Vec<&str> = args.split_whitespace().collect();
-        if tokens.len() <= 1 {
-            return None;
-        }
-
-        let mut idx = 1;
-        while idx < tokens.len() {
-            let token = tokens[idx];
-            match token {
-                "--log-level" | "--port" | "--hostname" | "--mdns-domain" | "--attach"
-                | "--password" | "-p" | "--dir" | "--model" | "--agent" | "--format"
-                | "--title" | "--variant" | "-s" | "--session" | "-c" | "--command" | "-m"
-                | "-f" | "--file" => {
-                    idx += 2;
-                    continue;
-                }
-                _ if token.starts_with("--") && token.contains('=') => {
-                    idx += 1;
-                    continue;
-                }
-                "--print-logs" | "--mdns" | "--fork" | "--share" | "--thinking" | "--continue"
-                | "-h" | "--help" | "-v" | "--version" => {
-                    idx += 1;
-                    continue;
-                }
-                "serve" | "web" | "acp" | "run" | "attach" | "pr" => {
-                    return Some(token.to_string());
-                }
-                _ if token.starts_with('-') => {
-                    if let Some(next) = tokens.get(idx + 1) {
-                        if !matches!(*next, "serve" | "web" | "acp" | "run" | "attach" | "pr")
-                            && !next.starts_with('-')
-                        {
-                            idx += 2;
-                            continue;
-                        }
-                    }
-                    idx += 1;
-                }
-                _ => return None,
-            }
-        }
-
-        None
-    }
-
     #[test]
     fn parse_caffeinate_flags_defaults_to_di() {
         match parse_flags(&[]) {
@@ -1001,34 +982,22 @@ mod tests {
     }
 
     #[test]
-    fn opencode_parser_detects_run_after_prompt_fast_path() {
+    fn parse_process_line_reads_pid_and_command() {
         assert_eq!(
-            detect_opencode_subcommand_from_args("opencode --prompt hello run"),
-            Some("run".to_string())
+            parse_process_line(" 123 /usr/local/bin/awake start -di"),
+            Some((123, "/usr/local/bin/awake start -di"))
         );
     }
 
     #[test]
-    fn opencode_parser_detects_server_subcommand() {
-        assert_eq!(
-            detect_opencode_subcommand_from_args("opencode --port 1234 serve"),
-            Some("serve".to_string())
-        );
+    fn detect_awake_start_command_matches_absolute_path() {
+        assert!(detect_awake_start_command(
+            "/Users/hiddenest/.local/bin/awake start -di"
+        ));
     }
 
     #[test]
-    fn opencode_parser_skips_continue_flag_before_subcommand() {
-        assert_eq!(
-            detect_opencode_subcommand_from_args("opencode --continue run"),
-            Some("run".to_string())
-        );
-    }
-
-    #[test]
-    fn opencode_parser_skips_continue_flag_without_eating_following_value() {
-        assert_eq!(
-            detect_opencode_subcommand_from_args("opencode --continue session-123 run"),
-            None
-        );
+    fn detect_awake_start_command_rejects_other_subcommands() {
+        assert!(!detect_awake_start_command("awake status"));
     }
 }
