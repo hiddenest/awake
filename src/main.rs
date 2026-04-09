@@ -10,15 +10,17 @@ use std::sync::{
     Arc,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 mod session_polling;
 
 use session_polling::{poll_target_session, ACTIVE_SESSION_WINDOW_SECS, TARGETS};
 
 const PID_FILE: &str = "/tmp/awake.pid";
+const PMSET_STATE_FILE: &str = "/tmp/awake.pmset-state";
 const DEFAULT_CAFFEINATE_FLAGS: &str = "di";
 const POLL_INTERVAL_SECS: u64 = 5;
+const WAKE_GRACE_TOLERANCE_SECS: u64 = 2;
 
 #[derive(Clone)]
 struct AppConfig {
@@ -97,10 +99,7 @@ fn cmd_start(config: &AppConfig, raw_args: &[String]) {
 
     let pid_file = Path::new(PID_FILE);
     if pid_file.exists() {
-        match fs::read_to_string(pid_file)
-            .ok()
-            .and_then(|value| value.trim().parse::<u32>().ok())
-        {
+        match read_pid_file(pid_file) {
             Some(existing_pid) if process_alive(existing_pid) => {
                 eprintln!("[awake] Already running (PID {})", existing_pid);
                 process::exit(1);
@@ -130,6 +129,8 @@ fn cmd_start(config: &AppConfig, raw_args: &[String]) {
         caffeinate_flags
     );
 
+    recover_stale_pmset_state();
+
     let mut state = DaemonState {
         targets: TARGETS.iter().copied().map(TargetState::new).collect(),
         pmset_disabled_by_awake: false,
@@ -138,8 +139,13 @@ fn cmd_start(config: &AppConfig, raw_args: &[String]) {
         caffeinate_flags,
         cleanup_done: false,
     };
+    let mut wake_grace_until: Option<Instant> = None;
 
     while !terminate.load(Ordering::Relaxed) {
+        let wake_grace_active = wake_grace_until
+            .map(|deadline| Instant::now() < deadline)
+            .unwrap_or(false);
+
         for target in &mut state.targets {
             let poll = poll_target_session(target.name);
             let caffeinate_alive = target.caffeinate_pid.map(process_alive).unwrap_or(false);
@@ -148,6 +154,8 @@ fn cmd_start(config: &AppConfig, raw_args: &[String]) {
                 if !caffeinate_alive {
                     match Command::new("caffeinate")
                         .arg(format!("-{}", state.caffeinate_flags))
+                        .arg("-w")
+                        .arg(process::id().to_string())
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .spawn()
@@ -167,12 +175,20 @@ fn cmd_start(config: &AppConfig, raw_args: &[String]) {
                         }
                     }
                 }
-            } else if let Some(caff_pid) = target.caffeinate_pid.take() {
-                kill_process(caff_pid);
-                println!(
-                    "[awake] {} idle — caffeinate released ({})",
-                    target.name, poll.detail
-                );
+            } else if let Some(caff_pid) = target.caffeinate_pid {
+                if wake_grace_active {
+                    println!(
+                        "[awake] {} wake grace active — keeping caffeinate ({})",
+                        target.name, poll.detail
+                    );
+                } else {
+                    target.caffeinate_pid = None;
+                    kill_process(caff_pid);
+                    println!(
+                        "[awake] {} idle — caffeinate released ({})",
+                        target.name, poll.detail
+                    );
+                }
             }
         }
 
@@ -183,8 +199,19 @@ fn cmd_start(config: &AppConfig, raw_args: &[String]) {
             .any(process_alive);
         sync_pmset_sleep_disabled(&mut state, any_active, config);
 
+        let sleep_started_at = SystemTime::now();
+        let monotonic_sleep_started_at = Instant::now();
         if sleep_with_interrupt(&terminate, Duration::from_secs(POLL_INTERVAL_SECS)) {
             break;
+        }
+
+        if detected_sleep_wake_gap(sleep_started_at, monotonic_sleep_started_at) {
+            wake_grace_until =
+                Some(Instant::now() + Duration::from_secs(ACTIVE_SESSION_WINDOW_SECS));
+            println!(
+                "[awake] Sleep/wake gap detected — preserving active assertions for {}s while sessions resume",
+                ACTIVE_SESSION_WINDOW_SECS
+            );
         }
     }
 
@@ -198,10 +225,7 @@ fn cmd_stop() {
         process::exit(1);
     }
 
-    let pid = match fs::read_to_string(pid_file)
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-    {
+    let pid = match read_pid_file(pid_file) {
         Some(pid) => pid,
         None => {
             println!("[awake] Not running (stale PID file)");
@@ -227,10 +251,7 @@ fn cmd_status() {
         return;
     }
 
-    let pid = match fs::read_to_string(pid_file)
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-    {
+    let pid = match read_pid_file(pid_file) {
         Some(pid) => pid,
         None => {
             println!("[awake] Status: stopped (stale PID file)");
@@ -490,6 +511,12 @@ fn sync_pmset_sleep_disabled(state: &mut DaemonState, desired: bool, _config: &A
 
         if run_pmset_command(&["-a", "disablesleep", "1"]) {
             state.pmset_disabled_by_awake = true;
+            persist_pmset_restore_value(
+                state
+                    .pmset_original_sleep_disabled
+                    .as_deref()
+                    .unwrap_or("0"),
+            );
             println!("[awake] pmset -a disablesleep enabled");
         } else {
             warn_pmset_once(state);
@@ -504,11 +531,50 @@ fn sync_pmset_sleep_disabled(state: &mut DaemonState, desired: bool, _config: &A
             .unwrap_or_else(|| "0".to_string());
         if run_pmset_command(&["-a", "disablesleep", &restore_value]) {
             state.pmset_disabled_by_awake = false;
+            clear_pmset_restore_value();
             println!("[awake] pmset disablesleep restored to {}", restore_value);
         } else {
             warn_pmset_once(state);
         }
     }
+}
+
+fn recover_stale_pmset_state() {
+    let Some(restore_value) = read_pmset_restore_value() else {
+        return;
+    };
+
+    let current_value = get_sleep_disabled_value();
+    if current_value.as_deref() == Some("1")
+        && run_pmset_command(&["-a", "disablesleep", &restore_value])
+    {
+        println!(
+            "[awake] Restored stale pmset disablesleep state to {} from previous run",
+            restore_value
+        );
+    }
+
+    clear_pmset_restore_value();
+}
+
+fn persist_pmset_restore_value(value: &str) {
+    if let Err(err) = fs::write(PMSET_STATE_FILE, format!("{}\n", value)) {
+        eprintln!(
+            "[awake] Warning: failed to persist pmset restore state in {}: {}",
+            PMSET_STATE_FILE, err
+        );
+    }
+}
+
+fn read_pmset_restore_value() -> Option<String> {
+    fs::read_to_string(PMSET_STATE_FILE)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn clear_pmset_restore_value() {
+    let _ = fs::remove_file(PMSET_STATE_FILE);
 }
 
 fn warn_pmset_once(state: &mut DaemonState) {
@@ -540,7 +606,23 @@ fn cleanup(state: &mut DaemonState) {
             pmset_sudoers_path: PathBuf::new(),
         },
     );
-    let _ = fs::remove_file(PID_FILE);
+    remove_pid_file_for_process(process::id());
+}
+
+fn read_pid_file(path: &Path) -> Option<u32> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+}
+
+fn remove_pid_file_for_process(expected_pid: u32) {
+    let path = Path::new(PID_FILE);
+    match read_pid_file(path) {
+        Some(pid) if pid == expected_pid => {
+            let _ = fs::remove_file(path);
+        }
+        _ => {}
+    }
 }
 
 fn install_script_systemwide(config: &AppConfig) -> Result<(), String> {
@@ -710,6 +792,18 @@ fn sleep_with_interrupt(terminate: &AtomicBool, total: Duration) -> bool {
     terminate.load(Ordering::Relaxed)
 }
 
+fn detected_sleep_wake_gap(
+    sleep_started_at: SystemTime,
+    monotonic_sleep_started_at: Instant,
+) -> bool {
+    let wall_elapsed = match SystemTime::now().duration_since(sleep_started_at) {
+        Ok(duration) => duration,
+        Err(_) => return false,
+    };
+    let monotonic_elapsed = monotonic_sleep_started_at.elapsed();
+    wall_elapsed > monotonic_elapsed + Duration::from_secs(WAKE_GRACE_TOLERANCE_SECS)
+}
+
 fn process_alive(pid: u32) -> bool {
     Command::new("kill")
         .arg("-0")
@@ -872,6 +966,44 @@ mod tests {
     }
 
     #[test]
+    fn remove_pid_file_for_process_only_removes_matching_pid() {
+        let path = Path::new(PID_FILE);
+        let original_contents = fs::read_to_string(path).ok();
+
+        fs::write(path, "111\n").unwrap();
+        remove_pid_file_for_process(222);
+        assert_eq!(read_pid_file(path), Some(111));
+
+        remove_pid_file_for_process(111);
+        assert!(!path.exists());
+
+        match original_contents {
+            Some(contents) => {
+                let _ = fs::write(path, contents);
+            }
+            None => {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    #[test]
+    fn detected_sleep_wake_gap_requires_wall_clock_jump() {
+        let wall_elapsed = Duration::from_secs(120);
+        let monotonic_elapsed = Duration::from_secs(POLL_INTERVAL_SECS);
+        assert!(wall_elapsed > monotonic_elapsed + Duration::from_secs(WAKE_GRACE_TOLERANCE_SECS));
+    }
+
+    #[test]
+    fn detected_sleep_wake_gap_ignores_normal_poll_jitter() {
+        let wall_elapsed = Duration::from_secs(POLL_INTERVAL_SECS + 1);
+        let monotonic_elapsed = Duration::from_secs(POLL_INTERVAL_SECS);
+        assert!(
+            !(wall_elapsed > monotonic_elapsed + Duration::from_secs(WAKE_GRACE_TOLERANCE_SECS))
+        );
+    }
+
+    #[test]
     fn opencode_parser_detects_run_after_prompt_fast_path() {
         assert_eq!(
             detect_opencode_subcommand_from_args("opencode --prompt hello run"),
@@ -902,5 +1034,4 @@ mod tests {
             None
         );
     }
-
 }

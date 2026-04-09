@@ -25,6 +25,8 @@ The daemon polls every **5 seconds**.
 
 `awake` treats a provider as active only when its latest observed session activity is still within a **15 second active window**.
 
+If macOS enters **system sleep** (for example, lid close) and later wakes, `awake` detects the sleep/wake gap and keeps any already-active assertion alive for one recovery window while provider session files/databases resume updating.
+
 ### Provider-specific checks
 
 - **Claude Code**
@@ -42,6 +44,8 @@ The daemon polls every **5 seconds**.
   - reads the most recently updated non-archived session from `session`
 
 If the latest provider activity falls outside that 15 second window, the target is treated as idle and its `caffeinate` process is released.
+
+`awake` also persists the previous `pmset SleepDisabled` value while it owns that setting, so if the daemon is restarted unexpectedly it can restore stale `pmset` state on the next launch.
 
 ## Architecture
 
@@ -165,6 +169,7 @@ Starts the daemon in the foreground.
 - polls supported session providers every 5 seconds
 - starts per-target `caffeinate` children when an active session is detected
 - enables `pmset -a disablesleep 1` while at least one target is active
+- preserves existing assertions briefly after a sleep/wake resume so active sessions are not dropped immediately on wake
 
 ### `stop`
 
@@ -295,6 +300,8 @@ The installed LaunchAgent:
   - `~/Library/Logs/awake.log`
   - `~/Library/Logs/awake.err`
 
+During normal operation, each `caffeinate` child is started with `-w <awake-pid>` so it exits automatically if the daemon itself dies or is restarted.
+
 ## Environment overrides
 
 For advanced setups and testing, these environment variables are supported:
@@ -333,6 +340,8 @@ If `status` says a provider is idle and `caffeinate` is not active, that can be 
 - the GUI/runtime may be present but the latest session update is stale
 - archived sessions are ignored
 - idle targets are released after 15 seconds without new activity
+
+If the machine was only **locked** (display sleep), `awake` should continue polling normally. The wake-grace logic is specifically for **system sleep / lid-close** gaps where polling is suspended by macOS.
 
 ## Limitations
 
