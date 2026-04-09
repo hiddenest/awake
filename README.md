@@ -31,19 +31,19 @@ If macOS enters **system sleep** (for example, lid close) and later wakes, `awak
 
 - **Claude Code**
   - checks whether the Claude GUI app is present, or whether a live IDE lock exists in `~/.claude/ide`
-  - checks whether the newest transcript in `~/.claude/transcripts` was updated recently
+  - treats the newest transcript in `~/.claude/transcripts` as an active session while the runtime is present
 
 - **Codex**
   - checks whether the Codex GUI app is present
   - opens the newest `~/.codex/state_*.sqlite` database read-only
-  - reads the most recently updated non-archived thread from `threads`
+  - treats the newest non-archived thread from `threads` as active while the GUI runtime is present
 
 - **OpenCode**
   - checks whether the OpenCode GUI app is present, or whether an `opencode` CLI/TUI process is running
   - opens `~/.local/share/opencode/opencode.db` read-only
-  - reads the most recently updated non-archived activity across `session`, `message`, `part`, and `todo`
+  - treats the newest non-archived activity across `session`, `message`, `part`, and `todo` as active while the runtime is present
 
-If the latest provider activity falls outside that 15 second window, the target is treated as idle and its `caffeinate` process is released.
+If a supported runtime is present and matching session state exists, the target remains active and its `caffeinate` process stays alive.
 
 `awake` also persists the previous `pmset SleepDisabled` value while it owns that setting, so if the daemon is restarted unexpectedly it can restore stale `pmset` state on the next launch.
 
