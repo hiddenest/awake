@@ -271,10 +271,7 @@ fn cmd_status() {
         println!("[awake]   {}: {}", name, poll.detail);
     }
 
-    println!(
-        "[awake]   caffeinate: active only while a polled session shows recent activity ({}s window)",
-        ACTIVE_SESSION_WINDOW_SECS
-    );
+    println!("[awake]   caffeinate: active while a supported runtime has session state present");
     println!(
         "[awake]   pmset SleepDisabled: {}",
         get_sleep_disabled_value().unwrap_or_else(|| "unknown".to_string())
