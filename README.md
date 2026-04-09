@@ -1,46 +1,63 @@
 # awake
 
-`awake` is a macOS CLI that keeps your machine awake **only while supported AI coding CLIs are doing real work**.
+`awake` is a macOS CLI that keeps your machine awake **only while supported AI coding tools have an actively progressing session**.
 
-Instead of holding a permanent `caffeinate` assertion, `awake` watches known agent processes, checks whether they are actually active, and only then enables:
+Instead of holding a permanent `caffeinate` assertion, `awake` polls provider-specific session state and only then enables:
 
 - `caffeinate` for display and/or idle-sleep prevention
 - `pmset -a disablesleep` for lid-close sleep prevention when permissions allow it
 
-When activity stops, `awake` releases the assertion and restores the previous `SleepDisabled` setting.
+When session activity stops, `awake` releases the assertion and restores the previous `SleepDisabled` setting.
 
 ## What it watches
 
-`awake` watches these exact process names:
+`awake` currently tracks these session providers:
 
-- `claude`
+- `claude-code`
 - `codex`
 - `opencode`
-- `opencode-cli`
-- `pi`
+
+Each provider has its own polling strategy, but they all share the same contract: a provider is only considered active when there is a live runtime plus a recently updated session artifact.
 
 ## How activity detection works
 
 The daemon polls every **5 seconds**.
 
-For normal CLI processes, `awake` treats a process as active when either of these changes between polls:
+`awake` treats a provider as active only when its latest observed session activity is still within a **15 second active window**.
 
-- the direct child-process count increases
-- the process CPU time increases by at least `0.01s`
+### Provider-specific checks
 
-For server-style processes, `awake` is stricter:
+- **Claude Code**
+  - checks whether the Claude GUI app is present, or whether a live IDE lock exists in `~/.claude/ide`
+  - checks whether the newest transcript in `~/.claude/transcripts` was updated recently
 
-- `codex app-server`
-- `opencode serve`
-- `opencode web`
-- `opencode acp`
-- `opencode-cli serve`
-- `opencode-cli web`
-- `opencode-cli acp`
+- **Codex**
+  - checks whether the Codex GUI app is present
+  - opens the newest `~/.codex/state_*.sqlite` database read-only
+  - reads the most recently updated non-archived thread from `threads`
 
-These activate on **child-process activity only**, not CPU-only changes.
+- **OpenCode**
+  - checks whether the OpenCode GUI app is present
+  - opens `~/.local/share/opencode/opencode.db` read-only
+  - reads the most recently updated non-archived session from `session`
 
-Newly discovered PIDs do not count as active just because they appeared. If no activity is seen for 3 polls in a row, the target is treated as idle and its `caffeinate` process is released.
+If the latest provider activity falls outside that 15 second window, the target is treated as idle and its `caffeinate` process is released.
+
+## Architecture
+
+Provider polling logic is split by service so each integration can evolve independently:
+
+```text
+src/
+  main.rs
+  session_polling/
+    mod.rs
+    claude_code.rs
+    codex.rs
+    opencode.rs
+```
+
+`main.rs` owns daemon lifecycle, CLI commands, `caffeinate`, and `pmset` handling. `src/session_polling/` owns provider-specific session detection.
 
 ## Requirements
 
@@ -145,8 +162,8 @@ awake uninstall
 Starts the daemon in the foreground.
 
 - creates `/tmp/awake.pid`
-- polls watched processes every 5 seconds
-- starts per-target `caffeinate` children when activity is detected
+- polls supported session providers every 5 seconds
+- starts per-target `caffeinate` children when an active session is detected
 - enables `pmset -a disablesleep 1` while at least one target is active
 
 ### `stop`
@@ -162,7 +179,7 @@ Stops the running daemon identified by `/tmp/awake.pid`.
 Shows:
 
 - whether the daemon is running
-- which watched process names are currently detected
+- the current session state for Claude Code, Codex, and OpenCode
 - the current `pmset` `SleepDisabled` value
 
 ### `install`
@@ -311,14 +328,14 @@ Check the current `SleepDisabled` value:
 pmset -g
 ```
 
-If `status` says a target is detected but `caffeinate` is not active yet, that can be expected:
+If `status` says a provider is idle and `caffeinate` is not active, that can be expected:
 
-- newly seen processes do not immediately count as active
-- server-style processes need child-process activity
+- the GUI/runtime may be present but the latest session update is stale
+- archived sessions are ignored
 - idle targets are released after 15 seconds without new activity
 
 ## Limitations
 
-- `codex` may appear as `node` depending on how it is launched, so `pgrep -x codex` may miss it
-- activity detection is heuristic-based, not API-integrated
+- activity detection depends on provider-local artifacts such as transcript mtimes and SQLite metadata
+- session freshness is inferred from local timestamps, not a first-party provider API
 - `pmset` behavior depends on your permission model and system policy
