@@ -40,8 +40,10 @@ If macOS enters **system sleep** (for example, lid close) and later wakes, `awak
 
 - **OpenCode**
   - checks whether the OpenCode GUI app is present, or whether an `opencode` CLI session is running with a real interactive subcommand such as `run`, `attach`, or `pr`
-  - opens `~/.local/share/opencode/opencode.db` read-only
-  - treats the newest non-archived activity across `session`, `message`, `part`, and `todo` as active while the runtime is present
+  - prefers the live `/session/status` server endpoint when an OpenCode server is reachable on loopback
+  - otherwise opens `~/.local/share/opencode/opencode.db` read-only
+  - treats a process-matched root session as active when the runtime is present and either live status is `busy`/`retry`, the session still has an unfinished assistant message or running/pending tool part, or the newest activity across `session`, `message`, `part`, and `todo` is still within the active window
+  - also reads the newest OpenCode log heartbeat from `~/.local/share/opencode/log/*.log` for additional runtime detail
 
 If a supported runtime is present and matching session state exists, the target remains active and its `caffeinate` process stays alive.
 
