@@ -36,14 +36,6 @@ fn claude_runtime_detail(gui_present: bool, ide_lock_present: bool) -> String {
     }
 }
 
-fn gui_runtime_detail(gui_present: bool, app_name: &str) -> String {
-    if gui_present {
-        format!("{} GUI app present", app_name)
-    } else {
-        format!("no {} GUI app", app_name)
-    }
-}
-
 fn claude_ide_lock_active() -> bool {
     let dir = home_dir().join(".claude/ide");
     let entries = match fs::read_dir(dir) {
@@ -141,7 +133,7 @@ fn newest_file_age_secs(dir: &Path) -> Option<(PathBuf, u64)> {
 }
 
 fn sqlite_single_line(path: &Path, query: &str) -> Option<String> {
-    let uri = format!("file:{}?mode=ro&immutable=1", path.display());
+    let uri = format!("file:{}?mode=ro", path.display());
     let output = crate::command_output("sqlite3", &[&uri, query]).ok()?;
     if !output.status.success() {
         return None;
