@@ -83,23 +83,30 @@ fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".to_string()))
 }
 
-fn newest_matching_file(dir: &Path, suffix_pattern: &str) -> Option<PathBuf> {
-    let suffix = suffix_pattern.strip_prefix("*")?;
+fn newest_matching_file(dir: &Path, pattern: &str) -> Option<PathBuf> {
+    let (prefix, suffix) = match pattern.split_once('*') {
+        Some((p, s)) => (p, s),
+        None => return None,
+    };
     let mut newest: Option<(PathBuf, SystemTime)> = None;
     for entry in fs::read_dir(dir).ok()? {
-        let entry = entry.ok()?;
+        let Ok(entry) = entry else { continue };
         let path = entry.path();
-        let metadata = entry.metadata().ok()?;
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
         if !metadata.is_file() {
             continue;
         }
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if !name.ends_with(suffix) {
+        if !name.starts_with(prefix) || !name.ends_with(suffix) {
             continue;
         }
-        let modified = metadata.modified().ok()?;
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
         match &newest {
             Some((_, current)) if modified <= *current => {}
             _ => newest = Some((path, modified)),
@@ -111,13 +118,17 @@ fn newest_matching_file(dir: &Path, suffix_pattern: &str) -> Option<PathBuf> {
 fn newest_file_age_secs(dir: &Path) -> Option<(PathBuf, u64)> {
     let mut newest: Option<(PathBuf, SystemTime)> = None;
     for entry in fs::read_dir(dir).ok()? {
-        let entry = entry.ok()?;
+        let Ok(entry) = entry else { continue };
         let path = entry.path();
-        let metadata = entry.metadata().ok()?;
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
         if !metadata.is_file() {
             continue;
         }
-        let modified = metadata.modified().ok()?;
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
         match &newest {
             Some((_, current)) if modified <= *current => {}
             _ => newest = Some((path, modified)),
