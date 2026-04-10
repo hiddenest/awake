@@ -4,7 +4,7 @@ use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{self, Command, Stdio};
+use std::process::{self, Child, Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -30,14 +30,14 @@ struct AppConfig {
 
 struct TargetState {
     name: &'static str,
-    caffeinate_pid: Option<u32>,
+    caffeinate_child: Option<Child>,
 }
 
 impl TargetState {
     fn new(name: &'static str) -> Self {
         Self {
             name,
-            caffeinate_pid: None,
+            caffeinate_child: None,
         }
     }
 }
@@ -90,7 +90,7 @@ fn main() {
 
 fn usage(program: &str) {
     println!(
-        "Usage: {} {{start|stop|status|setup|install|uninstall}} [options]\n\nCommands:\n  start [options]       Start the awake daemon in the foreground. The daemon polls GUI-backed session state every {} seconds and only keeps the Mac awake while a real session is actively progressing.\n  stop                  Stop the running awake daemon and release any active caffeinate/pmset state managed by it.\n  status                Show whether the daemon is running, the current session state for Claude Code, Codex, and OpenCode, and the current SleepDisabled state reported by pmset.\n  setup [options]       Install or reuse /usr/local/bin/awake, install the LaunchAgent, and optionally configure the pmset sudoers rule for lid-close sleep prevention.\n  install [options]     Write and load the LaunchAgent plist in ~/Library/LaunchAgents so awake starts automatically at login.\n  uninstall             Unload and remove the installed LaunchAgent plist.\n\nOptions for start/install/setup:\n  -D, -d, --display      Keep the display awake while a session is active (caffeinate -d).\n  -i, --idle-system      Prevent idle system sleep while a session is active (caffeinate -i).\n\nBehavior notes:\n  - Session providers: claude-code, codex, opencode\n  - OpenCode is treated as active only when the OpenCode GUI process or a real CLI session is present and its session database shows a recent update\n  - Codex is treated as active when the Codex desktop/runtime is present and its thread state shows a recent update\n  - Claude Code is treated as active when its transcript/session files are still being updated\n  - A session update is considered active for up to {} seconds after its latest observed activity\n  - If no options are provided, awake uses the default caffeinate flags: -{}\n  - setup/install pass the selected flags through to the LaunchAgent configuration",
+        "Usage:\n  {0} start [options]\n    Start the awake daemon in the foreground. The daemon polls session state every {1} seconds and only keeps the Mac awake while a real session is actively progressing.\n\n  {0} stop\n    Stop the running awake daemon and release any active caffeinate/pmset state managed by it.\n\n  {0} status\n    Show whether the daemon is running, the current session state for Claude Code, Codex, and OpenCode, and the current SleepDisabled state reported by pmset.\n\n  {0} install [options]\n    Write and load the LaunchAgent plist in ~/Library/LaunchAgents so awake starts automatically at login.\n\n  {0} setup [options]\n    Install or reuse /usr/local/bin/awake, install the LaunchAgent, and optionally configure the pmset sudoers rule for lid-close sleep prevention.\n\n  {0} uninstall\n    Unload and remove the installed LaunchAgent plist.\n\nOptions for start/install/setup:\n  -D, -d, --display      Keep the display awake while a session is active (caffeinate -d).\n  -i, --idle-system      Prevent idle system sleep while a session is active (caffeinate -i).\n\nBehavior notes:\n  - Session providers: claude-code, codex, opencode\n  - OpenCode is treated as active only when a running OpenCode process matches a non-archived root session for the same directory and that session updated recently\n  - Codex is treated as active only when a running Codex process maps to a live rollout file and the matching thread updated recently\n  - Claude Code is treated as active only when a live Claude workspace maps to a project session file that updated recently\n  - A session update is considered active for up to {2} seconds after its latest observed activity\n  - If no options are provided, awake uses the default caffeinate flags: -{3}\n  - setup/install pass the selected flags through to the LaunchAgent configuration",
         program, POLL_INTERVAL_SECS, ACTIVE_SESSION_WINDOW_SECS, DEFAULT_CAFFEINATE_FLAGS
     );
 }
@@ -161,7 +161,14 @@ fn cmd_start(config: &AppConfig, raw_args: &[String]) {
 
         for target in &mut state.targets {
             let poll = poll_target_session(target.name);
-            let caffeinate_alive = target.caffeinate_pid.map(process_alive).unwrap_or(false);
+            let caffeinate_alive = target
+                .caffeinate_child
+                .as_mut()
+                .map(child_alive)
+                .unwrap_or(false);
+            if !caffeinate_alive && target.caffeinate_child.is_some() {
+                target.caffeinate_child = None;
+            }
 
             if poll.active {
                 if !caffeinate_alive {
@@ -174,7 +181,7 @@ fn cmd_start(config: &AppConfig, raw_args: &[String]) {
                         .spawn()
                     {
                         Ok(child) => {
-                            target.caffeinate_pid = Some(child.id());
+                            target.caffeinate_child = Some(child);
                             println!(
                                 "[awake] {} session active — caffeinate -{} started ({})",
                                 target.name, state.caffeinate_flags, poll.detail
@@ -188,15 +195,15 @@ fn cmd_start(config: &AppConfig, raw_args: &[String]) {
                         }
                     }
                 }
-            } else if let Some(caff_pid) = target.caffeinate_pid {
+            } else if let Some(mut child) = target.caffeinate_child.take() {
                 if wake_grace_active {
+                    target.caffeinate_child = Some(child);
                     println!(
                         "[awake] {} wake grace active — keeping caffeinate ({})",
                         target.name, poll.detail
                     );
                 } else {
-                    target.caffeinate_pid = None;
-                    kill_process(caff_pid);
+                    terminate_child(&mut child);
                     println!(
                         "[awake] {} idle — caffeinate released ({})",
                         target.name, poll.detail
@@ -205,11 +212,13 @@ fn cmd_start(config: &AppConfig, raw_args: &[String]) {
             }
         }
 
-        let any_active = state
-            .targets
-            .iter()
-            .filter_map(|target| target.caffeinate_pid)
-            .any(process_alive);
+        let any_active = state.targets.iter().any(|target| {
+            target
+                .caffeinate_child
+                .as_ref()
+                .map(|child| process_alive(child.id()))
+                .unwrap_or(false)
+        });
         sync_pmset_sleep_disabled(&mut state, any_active, config);
 
         let sleep_started_at = SystemTime::now();
@@ -264,7 +273,7 @@ fn cmd_status() {
 
     for name in TARGETS {
         let poll = poll_target_session(name);
-        println!("[awake]   {}: {}", name, poll.detail);
+        println!("{}", provider_status_line(name, &poll));
     }
 
     println!("[awake]   caffeinate: active while a supported runtime has session state present");
@@ -587,8 +596,8 @@ fn cleanup(state: &mut DaemonState) {
     state.cleanup_done = true;
     println!("[awake] Shutting down...");
     for target in &mut state.targets {
-        if let Some(pid) = target.caffeinate_pid.take() {
-            kill_process(pid);
+        if let Some(mut child) = target.caffeinate_child.take() {
+            terminate_child(&mut child);
         }
     }
     sync_pmset_sleep_disabled(
@@ -851,6 +860,20 @@ fn process_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+fn child_alive(child: &mut Child) -> bool {
+    match child.try_wait() {
+        Ok(Some(_)) => false,
+        Ok(None) => true,
+        Err(_) => process_alive(child.id()),
+    }
+}
+
+fn terminate_child(child: &mut Child) {
+    let _ = child.try_wait();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn kill_process(pid: u32) {
     let _ = Command::new("kill")
         .arg(pid.to_string())
@@ -871,6 +894,48 @@ fn command_success(program: &str, args: &[&str]) -> bool {
 
 fn command_output(program: &str, args: &[&str]) -> io::Result<std::process::Output> {
     Command::new(program).args(args).output()
+}
+
+fn provider_status_line(name: &str, poll: &session_polling::SessionPollResult) -> String {
+    if poll.active {
+        match poll.worked_for_secs.or(poll.last_activity_age_secs) {
+            Some(secs) => format!("[{}] RUNNING (worked for {})", name, human_duration(secs)),
+            None => format!("[{}] RUNNING", name),
+        }
+    } else {
+        match poll.last_activity_age_secs {
+            Some(secs) => format!("[{}] IDLE ({} ago)", name, human_duration(secs)),
+            None => format!("[{}] IDLE", name),
+        }
+    }
+}
+
+fn human_duration(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{} sec", secs);
+    }
+
+    let minutes = secs / 60;
+    if minutes < 60 {
+        return format!("{} min", minutes);
+    }
+
+    let hours = minutes / 60;
+    let remaining_minutes = minutes % 60;
+    if hours < 24 {
+        if remaining_minutes == 0 {
+            return format!("{} hr", hours);
+        }
+        return format!("{} hr {} min", hours, remaining_minutes);
+    }
+
+    let days = hours / 24;
+    let remaining_hours = hours % 24;
+    if remaining_hours == 0 {
+        format!("{} day", days)
+    } else {
+        format!("{} day {} hr", days, remaining_hours)
+    }
 }
 
 fn xml_escape(value: &str) -> String {
@@ -979,6 +1044,28 @@ mod tests {
         assert!(
             !(wall_elapsed > monotonic_elapsed + Duration::from_secs(WAKE_GRACE_TOLERANCE_SECS))
         );
+    }
+
+    #[test]
+    fn detected_sleep_wake_gap_returns_true_after_large_resume_gap() {
+        let wall_elapsed = Duration::from_secs(POLL_INTERVAL_SECS + WAKE_GRACE_TOLERANCE_SECS + 5);
+        let monotonic_elapsed = Duration::from_secs(POLL_INTERVAL_SECS);
+
+        assert!(detected_sleep_wake_gap(
+            SystemTime::now() - wall_elapsed,
+            Instant::now() - monotonic_elapsed,
+        ));
+    }
+
+    #[test]
+    fn detected_sleep_wake_gap_returns_false_for_normal_poll_delay() {
+        let wall_elapsed = Duration::from_secs(POLL_INTERVAL_SECS + 1);
+        let monotonic_elapsed = Duration::from_secs(POLL_INTERVAL_SECS);
+
+        assert!(!detected_sleep_wake_gap(
+            SystemTime::now() - wall_elapsed,
+            Instant::now() - monotonic_elapsed,
+        ));
     }
 
     #[test]

@@ -1,11 +1,34 @@
 use super::{
     activity_within_window, age_from_epoch_millis, gui_app_running, home_dir,
-    process_command_lines, sqlite_single_line, SessionPollResult,
+    process_command_lines, process_infos, sql_quote, sqlite_single_line, ProcessInfo,
+    SessionPollResult, SQLITE_FIELD_SEPARATOR,
 };
+use std::path::{Component, Path, PathBuf};
 
 const OPENCODE_GUI_APP_NAME: &str = "OpenCode";
-const OPENCODE_CLI_PROCESS_NAME: &str = "opencode";
-const OPENCODE_ACTIVITY_QUERY: &str = "select s.id,s.title,s.directory,max(s.time_updated,ifnull((select max(m.time_updated) from message m where m.session_id = s.id),0),ifnull((select max(p.time_updated) from part p where p.session_id = s.id),0),ifnull((select max(t.time_updated) from todo t where t.session_id = s.id),0)) from session s where s.time_archived is null order by 4 desc limit 1;";
+const OPENCODE_PROCESS_NAME: &str = "opencode";
+
+const NON_INTERACTIVE_COMMANDS: [&str; 12] = [
+    "completion",
+    "acp",
+    "mcp",
+    "debug",
+    "providers",
+    "agent",
+    "upgrade",
+    "uninstall",
+    "serve",
+    "web",
+    "models",
+    "stats",
+];
+
+struct OpenCodeActivity {
+    title: String,
+    directory: String,
+    created_at: u64,
+    updated_at: u64,
+}
 
 pub(super) fn poll_session() -> SessionPollResult {
     let gui_present = gui_app_running(OPENCODE_GUI_APP_NAME);
@@ -13,70 +36,87 @@ pub(super) fn poll_session() -> SessionPollResult {
     let runtime_present = gui_present || cli_present;
     let db_path = home_dir().join(".local/share/opencode/opencode.db");
 
-    match sqlite_single_line(&db_path, OPENCODE_ACTIVITY_QUERY) {
-        Some(row) => {
-            let Some(activity) = parse_activity_row(&row) else {
-                return SessionPollResult {
-                    active: false,
-                    detail: "idle — OpenCode activity state unreadable".to_string(),
-                };
-            };
+    let matched_activity = process_infos(OPENCODE_PROCESS_NAME)
+        .into_iter()
+        .filter_map(|process| opencode_session_directory(&process))
+        .filter_map(|directory| root_activity_for_directory(&db_path, &directory))
+        .max_by_key(|activity| activity.updated_at);
 
-            if let Some(age_secs) = age_from_epoch_millis(Some(activity.updated_at)) {
-                if runtime_present && activity_within_window(age_secs) {
+    match matched_activity {
+        Some(activity) => {
+            let age_secs = match age_from_epoch_millis(Some(activity.updated_at)) {
+                Some(age_secs) => age_secs,
+                None => {
                     return SessionPollResult {
-                        active: true,
-                        detail: format!(
-                            "active OpenCode {} session in {} present (last update {}s ago) ({})",
-                            runtime_detail(gui_present, cli_present),
-                            activity.directory,
-                            age_secs,
-                            activity.title
-                        ),
-                    };
+                        active: false,
+                        detail: "idle — OpenCode activity timestamp unreadable".to_string(),
+                        last_activity_age_secs: None,
+                        worked_for_secs: None,
+                    }
                 }
+            };
+            let worked_for_secs = age_from_epoch_millis(Some(activity.created_at));
 
-                let runtime = runtime_presence_detail(gui_present, cli_present);
+            if runtime_present && activity_within_window(age_secs) {
                 return SessionPollResult {
-                    active: false,
+                    active: true,
                     detail: format!(
-                        "idle — latest OpenCode activity in {} updated {}s ago ({})",
-                        activity.directory, age_secs, runtime
+                        "active OpenCode {} session in {} present (last update {}s ago) ({})",
+                        runtime_detail(gui_present, cli_present),
+                        activity.directory,
+                        age_secs,
+                        activity.title
                     ),
+                    last_activity_age_secs: Some(age_secs),
+                    worked_for_secs,
                 };
             }
 
             SessionPollResult {
                 active: false,
-                detail: "idle — OpenCode activity timestamp unreadable".to_string(),
+                detail: format!(
+                    "idle — process-matched OpenCode activity in {} updated {}s ago ({})",
+                    activity.directory,
+                    age_secs,
+                    runtime_presence_detail(gui_present, cli_present)
+                ),
+                last_activity_age_secs: Some(age_secs),
+                worked_for_secs,
             }
         }
         None => SessionPollResult {
             active: false,
             detail: format!(
-                "idle — no OpenCode activity state found ({})",
+                "idle — no OpenCode session matched a running process ({})",
                 runtime_presence_detail(gui_present, cli_present)
             ),
+            last_activity_age_secs: None,
+            worked_for_secs: None,
         },
     }
 }
 
-struct OpenCodeActivity<'a> {
-    title: &'a str,
-    directory: &'a str,
-    updated_at: u64,
+fn root_activity_for_directory(
+    db_path: &std::path::Path,
+    directory: &std::path::Path,
+) -> Option<OpenCodeActivity> {
+    let normalized_directory = normalize_directory(directory);
+    let query = format!(
+        "select s.id,s.title,s.directory,s.time_created,max(s.time_updated,ifnull((select max(m.time_updated) from message m where m.session_id = s.id),0),ifnull((select max(p.time_updated) from part p where p.session_id = s.id),0),ifnull((select max(t.time_updated) from todo t where t.session_id = s.id),0)) from session s where s.time_archived is null and s.parent_id is null and s.directory = '{}' order by 5 desc limit 1;",
+        sql_quote(&normalized_directory.display().to_string())
+    );
+    let row = sqlite_single_line(db_path, &query)?;
+    parse_activity_row(&row)
 }
 
-fn parse_activity_row(row: &str) -> Option<OpenCodeActivity<'_>> {
-    let mut parts = row.split('|');
+fn parse_activity_row(row: &str) -> Option<OpenCodeActivity> {
+    let mut parts = row.split(SQLITE_FIELD_SEPARATOR);
     let _id = parts.next()?;
-    let title = parts.next()?;
-    let directory = parts.next()?;
-    let updated_at = parts.next()?.parse::<u64>().ok()?;
     Some(OpenCodeActivity {
-        title,
-        directory,
-        updated_at,
+        title: parts.next()?.to_string(),
+        directory: parts.next()?.to_string(),
+        created_at: parts.next()?.parse::<u64>().ok()?,
+        updated_at: parts.next()?.parse::<u64>().ok()?,
     })
 }
 
@@ -99,26 +139,14 @@ fn runtime_presence_detail(gui_present: bool, cli_present: bool) -> &'static str
 }
 
 fn opencode_cli_session_running() -> bool {
-    process_command_lines(OPENCODE_CLI_PROCESS_NAME)
+    process_command_lines(OPENCODE_PROCESS_NAME)
         .into_iter()
-        .filter_map(|line| detect_opencode_subcommand_from_args(&line))
-        .any(|subcommand| matches!(subcommand.as_str(), "run" | "attach" | "pr"))
+        .any(|line| is_interactive_opencode_invocation(&line))
 }
 
-fn detect_opencode_subcommand_from_args(args: &str) -> Option<String> {
-    if args.contains(" --prompt ") || args.contains(" --title ") {
-        let mut tokens = args.split_whitespace();
-        let _ = tokens.next();
-        for token in tokens {
-            if matches!(token, "run" | "attach" | "pr") {
-                return Some(token.to_string());
-            }
-        }
-        return None;
-    }
-
-    let tokens: Vec<&str> = args.split_whitespace().collect();
-    if tokens.len() <= 1 {
+fn opencode_session_directory(process: &ProcessInfo) -> Option<std::path::PathBuf> {
+    let tokens: Vec<&str> = process.command.split_whitespace().collect();
+    if tokens.is_empty() {
         return None;
     }
 
@@ -137,41 +165,94 @@ fn detect_opencode_subcommand_from_args(args: &str) -> Option<String> {
                 continue;
             }
             "--print-logs" | "--mdns" | "--fork" | "--share" | "--thinking" | "--continue"
-            | "-h" | "--help" | "-v" | "--version" => {
+            | "-h" | "--help" | "-v" | "--version" | "--pure" => {
                 idx += 1;
                 continue;
             }
-            "serve" | "web" | "acp" | "run" | "attach" | "pr" => {
-                return Some(token.to_string());
+            "run" | "attach" | "pr" => {
+                return process.cwd.as_deref().map(normalize_directory);
+            }
+            token
+                if NON_INTERACTIVE_COMMANDS.contains(&token)
+                    || token == "session"
+                    || token == "db"
+                    || token == "github"
+                    || token == "import"
+                    || token == "export"
+                    || token == "plugin" =>
+            {
+                return None;
             }
             _ if token.starts_with('-') => {
-                if let Some(next) = tokens.get(idx + 1) {
-                    if !matches!(*next, "serve" | "web" | "acp" | "run" | "attach" | "pr")
-                        && !next.starts_with('-')
-                    {
-                        idx += 2;
-                        continue;
-                    }
-                }
                 idx += 1;
             }
-            _ => return None,
+            _ => {
+                let path = PathBuf::from(token);
+                if path.is_absolute() {
+                    return Some(normalize_directory(&path));
+                }
+                return process
+                    .cwd
+                    .as_ref()
+                    .map(|cwd| normalize_directory(&cwd.join(path)));
+            }
         }
     }
 
-    None
+    process.cwd.as_deref().map(normalize_directory)
+}
+
+fn is_interactive_opencode_invocation(command_line: &str) -> bool {
+    opencode_session_directory(&ProcessInfo {
+        pid: 0,
+        command: command_line.to_string(),
+        cwd: Some(std::path::PathBuf::from(".")),
+    })
+    .is_some()
+}
+
+fn normalize_directory(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| normalize_lexical_path(path))
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::RootDir | Component::Normal(_) | Component::Prefix(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn test_process(command: &str, cwd: &str) -> ProcessInfo {
+        ProcessInfo {
+            pid: 1,
+            command: command.to_string(),
+            cwd: Some(std::path::PathBuf::from(cwd)),
+        }
+    }
+
     #[test]
     fn parse_activity_row_reads_title_directory_and_timestamp() {
-        let row = "ses_123|Build WXT migration|/tmp/project|1775714298852";
-        let activity = parse_activity_row(row).unwrap();
+        let row = format!(
+            "ses_123{sep}Build WXT migration{sep}/tmp/project{sep}1775710000000{sep}1775714298852",
+            sep = SQLITE_FIELD_SEPARATOR
+        );
+        let activity = parse_activity_row(&row).unwrap();
         assert_eq!(activity.title, "Build WXT migration");
         assert_eq!(activity.directory, "/tmp/project");
+        assert_eq!(activity.created_at, 1_775_710_000_000);
         assert_eq!(activity.updated_at, 1_775_714_298_852);
     }
 
@@ -181,34 +262,58 @@ mod tests {
     }
 
     #[test]
-    fn opencode_parser_detects_run_after_prompt_fast_path() {
+    fn parse_activity_row_handles_pipe_in_title() {
+        let row = format!(
+            "ses_123{sep}title | with pipe{sep}/tmp/project{sep}1775710000000{sep}1775714298852",
+            sep = SQLITE_FIELD_SEPARATOR
+        );
+        let activity = parse_activity_row(&row).unwrap();
+        assert_eq!(activity.title, "title | with pipe");
+    }
+
+    #[test]
+    fn bare_opencode_is_interactive() {
         assert_eq!(
-            detect_opencode_subcommand_from_args("opencode --prompt hello run"),
-            Some("run".to_string())
+            opencode_session_directory(&test_process("opencode", "/tmp/project")),
+            Some(std::path::PathBuf::from("/tmp/project"))
         );
     }
 
     #[test]
-    fn opencode_parser_detects_server_subcommand() {
+    fn opencode_project_argument_overrides_process_cwd() {
         assert_eq!(
-            detect_opencode_subcommand_from_args("opencode --port 1234 serve"),
-            Some("serve".to_string())
+            opencode_session_directory(&test_process("opencode worktree", "/tmp/project")),
+            Some(std::path::PathBuf::from("/tmp/project/worktree"))
         );
     }
 
     #[test]
-    fn opencode_parser_skips_continue_flag_before_subcommand() {
+    fn opencode_dot_project_is_normalized() {
         assert_eq!(
-            detect_opencode_subcommand_from_args("opencode --continue run"),
-            Some("run".to_string())
+            opencode_session_directory(&test_process("opencode .", "/tmp/project")),
+            Some(std::path::PathBuf::from("/tmp/project"))
         );
     }
 
     #[test]
-    fn opencode_parser_skips_continue_flag_without_eating_following_value() {
-        assert_eq!(
-            detect_opencode_subcommand_from_args("opencode --continue session-123 run"),
-            None
-        );
+    fn opencode_run_is_interactive() {
+        assert!(is_interactive_opencode_invocation("opencode run fix tests"));
+    }
+
+    #[test]
+    fn opencode_session_list_is_not_interactive() {
+        assert!(!is_interactive_opencode_invocation("opencode session list"));
+    }
+
+    #[test]
+    fn opencode_server_subcommand_is_not_interactive() {
+        assert!(!is_interactive_opencode_invocation(
+            "opencode --port 1234 serve"
+        ));
+    }
+
+    #[test]
+    fn opencode_continue_flag_without_subcommand_stays_interactive() {
+        assert!(is_interactive_opencode_invocation("opencode --continue"));
     }
 }

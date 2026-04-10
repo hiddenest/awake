@@ -1,10 +1,11 @@
 use super::{
-    activity_within_window, age_from_epoch_secs, gui_app_running, home_dir, newest_matching_file,
-    process_command_lines, sqlite_single_line, SessionPollResult,
+    activity_within_window, age_from_epoch_secs, gui_app_running, home_dir, matching_files,
+    process_command_lines, process_infos, sql_quote, sqlite_single_line, ProcessInfo,
+    SessionPollResult, SQLITE_FIELD_SEPARATOR,
 };
 
 const CODEX_GUI_APP_NAME: &str = "Codex";
-const CODEX_CLI_PROCESS_NAME: &str = "codex";
+const CODEX_PROCESS_NAME: &str = "codex";
 
 const NON_INTERACTIVE_SUBCOMMANDS: [&str; 11] = [
     "app-server",
@@ -20,75 +21,197 @@ const NON_INTERACTIVE_SUBCOMMANDS: [&str; 11] = [
     "cloud",
 ];
 
+struct CodexThread {
+    created_at: u64,
+    updated_at: u64,
+    source: String,
+    cwd: String,
+    title: String,
+}
+
+struct CodexProcessFiles {
+    db_paths: Vec<std::path::PathBuf>,
+    rollout_paths: Vec<std::path::PathBuf>,
+}
+
 pub(super) fn poll_session() -> SessionPollResult {
     let gui_present = gui_app_running(CODEX_GUI_APP_NAME);
     let cli_present = codex_cli_session_running();
     let runtime_present = gui_present || cli_present;
-    let db_path = match newest_matching_file(&home_dir().join(".codex"), "state_*.sqlite") {
-        Some(path) => path,
+    let fallback_db_paths = matching_files(&home_dir().join(".codex"), "state_*.sqlite");
+    if fallback_db_paths.is_empty() {
+        return SessionPollResult {
+            active: false,
+            detail: format!(
+                "idle — no Codex state database found ({})",
+                runtime_presence_detail(gui_present, cli_present)
+            ),
+            last_activity_age_secs: None,
+            worked_for_secs: None,
+        };
+    }
+
+    let matched_thread = process_infos(CODEX_PROCESS_NAME)
+        .into_iter()
+        .filter(|process| {
+            is_codex_app_server_invocation(&process.command)
+                || is_interactive_codex_invocation(&process.command)
+        })
+        .flat_map(|process| current_threads_for_process(&process, &fallback_db_paths))
+        .max_by_key(|thread| thread.updated_at);
+
+    match matched_thread {
         None => {
             return SessionPollResult {
                 active: false,
                 detail: format!(
-                    "idle — no Codex state database found ({})",
+                    "idle — no Codex thread matched a running process ({})",
                     runtime_presence_detail(gui_present, cli_present)
                 ),
+                last_activity_age_secs: None,
+                worked_for_secs: None,
             }
         }
-    };
-    let query = "select id,updated_at,source,cwd,title,archived from threads where archived = 0 order by updated_at desc limit 1;";
-
-    match sqlite_single_line(&db_path, query) {
-        Some(row) => {
-            let parts: Vec<&str> = row.split('|').collect();
-            if parts.len() < 6 {
-                return SessionPollResult {
-                    active: false,
-                    detail: "idle — Codex thread state unreadable".to_string(),
-                };
-            }
-
-            let updated_at = parts[1].parse::<u64>().ok();
-            let source = parts[2];
-            let cwd = parts[3];
-            let title = parts[4];
-
-            if let Some(age_secs) = age_from_epoch_secs(updated_at) {
-                if runtime_present && activity_within_window(age_secs) {
+        Some(thread) => {
+            let age_secs = match age_from_epoch_secs(Some(thread.updated_at)) {
+                Some(age_secs) => age_secs,
+                None => {
                     return SessionPollResult {
-                        active: true,
-                        detail: format!(
-                            "active {} session in {} present (last update {}s ago) ({})",
-                            source, cwd, age_secs, title
-                        ),
-                    };
+                        active: false,
+                        detail: "idle — Codex thread timestamp unreadable".to_string(),
+                        last_activity_age_secs: None,
+                        worked_for_secs: None,
+                    }
                 }
+            };
+            let worked_for_secs = age_from_epoch_secs(Some(thread.created_at));
 
+            if runtime_present && activity_within_window(age_secs) {
                 return SessionPollResult {
-                    active: false,
+                    active: true,
                     detail: format!(
-                        "idle — latest {} thread in {} updated {}s ago ({})",
-                        source,
-                        cwd,
-                        age_secs,
-                        runtime_presence_detail(gui_present, cli_present)
+                        "active {} session in {} present (last update {}s ago) ({})",
+                        thread.source, thread.cwd, age_secs, thread.title
                     ),
+                    last_activity_age_secs: Some(age_secs),
+                    worked_for_secs,
                 };
             }
 
             SessionPollResult {
                 active: false,
-                detail: "idle — Codex thread timestamp unreadable".to_string(),
+                detail: format!(
+                    "idle — process-matched {} thread in {} updated {}s ago ({})",
+                    thread.source,
+                    thread.cwd,
+                    age_secs,
+                    runtime_presence_detail(gui_present, cli_present)
+                ),
+                last_activity_age_secs: Some(age_secs),
+                worked_for_secs,
             }
         }
-        None => SessionPollResult {
-            active: false,
-            detail: format!(
-                "idle — no Codex thread state found ({})",
-                runtime_presence_detail(gui_present, cli_present)
-            ),
-        },
     }
+}
+
+fn current_threads_for_process(
+    process: &ProcessInfo,
+    fallback_db_paths: &[std::path::PathBuf],
+) -> Vec<CodexThread> {
+    let CodexProcessFiles {
+        db_paths,
+        rollout_paths,
+    } = codex_process_files(process);
+    if rollout_paths.is_empty() {
+        return Vec::new();
+    }
+
+    let db_paths = if db_paths.is_empty() {
+        fallback_db_paths.to_vec()
+    } else {
+        db_paths
+    };
+
+    db_paths
+        .into_iter()
+        .flat_map(|db_path| {
+            rollout_paths
+                .iter()
+                .filter_map(move |rollout_path| thread_for_rollout_path(&db_path, rollout_path))
+        })
+        .collect()
+}
+
+fn codex_process_files(process: &ProcessInfo) -> CodexProcessFiles {
+    let output = match crate::command_output("lsof", &["-p", &process.pid.to_string()]) {
+        Ok(output) if output.status.success() => output,
+        _ => {
+            return CodexProcessFiles {
+                db_paths: Vec::new(),
+                rollout_paths: Vec::new(),
+            }
+        }
+    };
+    parse_codex_process_files(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_codex_process_files(output: &str) -> CodexProcessFiles {
+    let mut db_paths = Vec::new();
+    let mut rollout_paths = Vec::new();
+
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 8 {
+            continue;
+        }
+
+        let fd = parts[3];
+        let Some(path) = parts.last() else {
+            continue;
+        };
+
+        if path.contains("/.codex/sessions/")
+            && path.contains("rollout-")
+            && path.ends_with(".jsonl")
+            && fd.ends_with('w')
+        {
+            rollout_paths.push(std::path::PathBuf::from(path));
+            continue;
+        }
+
+        if path.contains("/.codex/state_") && path.ends_with(".sqlite") {
+            db_paths.push(std::path::PathBuf::from(path));
+        }
+    }
+
+    db_paths.sort();
+    db_paths.dedup();
+    rollout_paths.sort();
+    rollout_paths.dedup();
+
+    CodexProcessFiles {
+        db_paths,
+        rollout_paths,
+    }
+}
+
+fn thread_for_rollout_path(
+    db_path: &std::path::Path,
+    rollout_path: &std::path::Path,
+) -> Option<CodexThread> {
+    let query = format!(
+        "select created_at,updated_at,source,cwd,title from threads where archived = 0 and rollout_path = '{}' limit 1;",
+        sql_quote(&rollout_path.display().to_string())
+    );
+    let row = sqlite_single_line(db_path, &query)?;
+    let mut parts = row.split(SQLITE_FIELD_SEPARATOR);
+    Some(CodexThread {
+        created_at: parts.next()?.parse().ok()?,
+        updated_at: parts.next()?.parse().ok()?,
+        source: parts.next()?.to_string(),
+        cwd: parts.next()?.to_string(),
+        title: parts.next()?.to_string(),
+    })
 }
 
 fn runtime_presence_detail(gui_present: bool, cli_present: bool) -> &'static str {
@@ -101,9 +224,14 @@ fn runtime_presence_detail(gui_present: bool, cli_present: bool) -> &'static str
 }
 
 fn codex_cli_session_running() -> bool {
-    process_command_lines(CODEX_CLI_PROCESS_NAME)
+    process_command_lines(CODEX_PROCESS_NAME)
         .into_iter()
         .any(|line| is_interactive_codex_invocation(&line))
+}
+
+fn is_codex_app_server_invocation(command_line: &str) -> bool {
+    let tokens: Vec<&str> = command_line.split_whitespace().collect();
+    matches!(tokens.get(1), Some(&"app-server"))
 }
 
 fn is_interactive_codex_invocation(command_line: &str) -> bool {
@@ -157,6 +285,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_codex_process_files_keeps_live_rollouts_and_state_dbs() {
+        let output = "\
+codex 123 user 15u REG 1,16 1 /Users/test/.codex/state_5.sqlite\n\
+codex 123 user 16u REG 1,16 1 /Users/test/.codex/state_v2.sqlite\n\
+codex 123 user 46w REG 1,16 1 /Users/test/.codex/sessions/2026/04/10/rollout-a.jsonl\n\
+codex 123 user 47r REG 1,16 1 /Users/test/.codex/sessions/2026/04/10/rollout-b.jsonl\n\
+codex 123 user 48w REG 1,16 1 /Users/test/.codex/archived_sessions/rollout-c.jsonl\n";
+        let files = parse_codex_process_files(output);
+        assert_eq!(
+            files.db_paths,
+            vec![
+                std::path::PathBuf::from("/Users/test/.codex/state_5.sqlite"),
+                std::path::PathBuf::from("/Users/test/.codex/state_v2.sqlite"),
+            ]
+        );
+        assert_eq!(
+            files.rollout_paths,
+            vec![std::path::PathBuf::from(
+                "/Users/test/.codex/sessions/2026/04/10/rollout-a.jsonl"
+            )]
+        );
+    }
+
+    #[test]
     fn bare_codex_is_interactive() {
         assert!(is_interactive_codex_invocation("codex"));
     }
@@ -198,6 +350,13 @@ mod tests {
     #[test]
     fn codex_app_server_is_not_interactive() {
         assert!(!is_interactive_codex_invocation(
+            "codex app-server --analytics-default-enabled"
+        ));
+    }
+
+    #[test]
+    fn codex_app_server_is_detected_separately() {
+        assert!(is_codex_app_server_invocation(
             "codex app-server --analytics-default-enabled"
         ));
     }
