@@ -9,6 +9,38 @@ Instead of holding a permanent `caffeinate` assertion, `awake` polls provider-sp
 
 When session activity stops, `awake` releases the assertion and restores the previous `SleepDisabled` setting.
 
+## Quick start
+
+Install `awake` with Homebrew:
+
+```bash
+brew install hiddenest/awake/awake
+awake setup
+```
+
+Then check what `awake` sees right now:
+
+```bash
+awake status
+```
+
+Typical output while a supported tool is actively working looks like this:
+
+```text
+[awake] Status: running (PID 12345)
+[claude-code] RUNNING (worked for 42 sec)
+[codex] IDLE (3 min ago)
+[opencode] IDLE
+[awake]   caffeinate: active while a supported runtime has session state present
+[awake]   pmset SleepDisabled: 1
+```
+
+If the daemon has not been started yet, you will simply see:
+
+```text
+[awake] Status: stopped
+```
+
 ## What it watches
 
 `awake` currently tracks these session providers:
@@ -87,18 +119,16 @@ The built binary will be at:
 
 ## Install with Homebrew
 
-`awake` is also distributed through a custom Homebrew tap:
+`awake` is distributed as a Homebrew formula in a custom tap, so you can install it directly without running a separate `brew tap` first:
 
 ```bash
-brew tap hiddenest/awake
-brew install awake
+brew install hiddenest/awake/awake
 ```
 
 Upgrade later with:
 
 ```bash
-brew update
-brew upgrade awake
+brew upgrade hiddenest/awake/awake
 ```
 
 After installation, run:
