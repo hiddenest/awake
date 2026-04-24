@@ -24,6 +24,7 @@ const NON_INTERACTIVE_SUBCOMMANDS: [&str; 11] = [
 struct CodexThread {
     created_at: u64,
     updated_at: u64,
+    unfinished_turn: bool,
     source: String,
     cwd: String,
     title: String,
@@ -86,12 +87,20 @@ pub(super) fn poll_session() -> SessionPollResult {
             };
             let worked_for_secs = age_from_epoch_secs(Some(thread.created_at));
 
-            if runtime_present && activity_within_window(age_secs) {
+            if runtime_present && (activity_within_window(age_secs) || thread.unfinished_turn) {
                 return SessionPollResult {
                     active: true,
                     detail: format!(
-                        "active {} session in {} present (last update {}s ago) ({})",
-                        thread.source, thread.cwd, age_secs, thread.title
+                        "active {} session in {} present (last update {}s ago{}) ({})",
+                        thread.source,
+                        thread.cwd,
+                        age_secs,
+                        if thread.unfinished_turn {
+                            ", unfinished turn"
+                        } else {
+                            ""
+                        },
+                        thread.title
                     ),
                     last_activity_age_secs: Some(age_secs),
                     worked_for_secs,
@@ -208,10 +217,56 @@ fn thread_for_rollout_path(
     Some(CodexThread {
         created_at: parts.next()?.parse().ok()?,
         updated_at: parts.next()?.parse().ok()?,
+        unfinished_turn: rollout_has_unfinished_turn(rollout_path),
         source: parts.next()?.to_string(),
         cwd: parts.next()?.to_string(),
         title: parts.next()?.to_string(),
     })
+}
+
+fn rollout_has_unfinished_turn(path: &std::path::Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    rollout_content_has_unfinished_turn(&content)
+}
+
+fn rollout_content_has_unfinished_turn(content: &str) -> bool {
+    let mut latest_turn_id: Option<String> = None;
+    let mut latest_turn_completed = false;
+
+    for line in content.lines() {
+        match top_level_rollout_event_type(line) {
+            Some("turn_context") => {
+                latest_turn_id = extract_json_string(line, "turn_id");
+                latest_turn_completed = false;
+            }
+            Some("task_complete") => {
+                if latest_turn_id.as_deref() == extract_json_string(line, "turn_id").as_deref() {
+                    latest_turn_completed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    latest_turn_id.is_some() && !latest_turn_completed
+}
+
+fn top_level_rollout_event_type(line: &str) -> Option<&str> {
+    let after_timestamp = line.strip_prefix("{\"timestamp\":\"")?;
+    let type_key = after_timestamp.find("\"type\":\"")?;
+    let value = &after_timestamp[type_key + "\"type\":\"".len()..];
+    let end = value.find('"')?;
+    Some(&value[..end])
+}
+
+fn extract_json_string(line: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\":\"", key);
+    let start = line.find(&needle)? + needle.len();
+    let value = &line[start..];
+    let end = value.find('"')?;
+    Some(value[..end].to_string())
 }
 
 fn runtime_presence_detail(gui_present: bool, cli_present: bool) -> &'static str {
@@ -398,5 +453,31 @@ codex 123 user 48w REG 1,16 1 /Users/test/.codex/archived_sessions/rollout-c.jso
         assert!(!is_interactive_codex_invocation(
             "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled"
         ));
+    }
+
+    #[test]
+    fn rollout_content_with_open_turn_is_unfinished() {
+        let content = r#"{"timestamp":"2026-04-24T13:00:00.000Z","type":"turn_context","payload":{"turn_id":"turn-a"}}
+{"timestamp":"2026-04-24T13:00:01.000Z","type":"response_item","payload":{"type":"function_call","call_id":"call-a"}}"#;
+
+        assert!(rollout_content_has_unfinished_turn(content));
+    }
+
+    #[test]
+    fn rollout_content_with_completed_latest_turn_is_finished() {
+        let content = r#"{"timestamp":"2026-04-24T13:00:00.000Z","type":"turn_context","payload":{"turn_id":"turn-a"}}
+{"timestamp":"2026-04-24T13:00:01.000Z","type":"task_complete","turn_id":"turn-a","payload":{}}
+{"timestamp":"2026-04-24T13:00:02.000Z","type":"turn_context","payload":{"turn_id":"turn-b"}}
+{"timestamp":"2026-04-24T13:00:03.000Z","type":"task_complete","turn_id":"turn-b","payload":{}}"#;
+
+        assert!(!rollout_content_has_unfinished_turn(content));
+    }
+
+    #[test]
+    fn rollout_content_ignores_nested_task_complete_text() {
+        let content = r#"{"timestamp":"2026-04-24T13:00:00.000Z","type":"turn_context","payload":{"turn_id":"turn-a"}}
+{"timestamp":"2026-04-24T13:00:01.000Z","type":"event_msg","payload":{"aggregated_output":"{\"type\":\"task_complete\",\"turn_id\":\"turn-a\"}"}}"#;
+
+        assert!(rollout_content_has_unfinished_turn(content));
     }
 }
