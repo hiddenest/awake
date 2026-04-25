@@ -1,5 +1,6 @@
 mod claude_code;
 mod codex;
+mod cursor;
 mod opencode;
 
 use std::env;
@@ -7,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(crate) const TARGETS: [&str; 3] = ["claude-code", "codex", "opencode"];
+pub(crate) const TARGETS: [&str; 4] = ["claude-code", "codex", "cursor-agent", "opencode"];
 pub(crate) const ACTIVE_SESSION_WINDOW_SECS: u64 = crate::POLL_INTERVAL_SECS * 3;
 pub(crate) const SQLITE_FIELD_SEPARATOR: char = '\u{1f}';
 
@@ -34,6 +35,7 @@ pub(crate) fn poll_target_session(name: &str) -> SessionPollResult {
     match name {
         "claude-code" => claude_code::poll_session(),
         "codex" => codex::poll_session(),
+        "cursor-agent" => cursor::poll_session(),
         "opencode" => opencode::poll_session(),
         _ => SessionPollResult {
             active: false,

@@ -1,7 +1,6 @@
 use super::{
-    activity_within_window, age_from_epoch_millis, gui_app_running, home_dir,
-    process_infos, sql_quote, sqlite_single_line, ProcessInfo, SessionPollResult,
-    SQLITE_FIELD_SEPARATOR,
+    activity_within_window, age_from_epoch_millis, gui_app_running, home_dir, process_infos,
+    sql_quote, sqlite_single_line, ProcessInfo, SessionPollResult, SQLITE_FIELD_SEPARATOR,
 };
 use std::fs;
 use std::path::{Component, Path, PathBuf};

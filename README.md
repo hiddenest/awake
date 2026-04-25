@@ -30,6 +30,7 @@ Example output:
 [awake] Status: running (PID 12345)
 [claude-code] RUNNING (worked for 42 sec)
 [codex] IDLE (3 min ago)
+[cursor-agent] IDLE
 [opencode] IDLE
 [awake]   caffeinate: active while a supported runtime has session state present
 [awake]   pmset SleepDisabled: 1
@@ -53,9 +54,11 @@ brew upgrade hiddenest/awake/awake
 
 - `claude-code`
 - `codex`
+- `cursor-agent`
 - `opencode`
 
 A provider is considered active only when there is both a live runtime and fresh session activity.
+For Cursor, `awake` watches both the standalone `cursor-agent` CLI and Cursor IDE agent transcripts.
 
 ## How it works
 
