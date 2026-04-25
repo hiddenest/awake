@@ -508,7 +508,8 @@ fn get_sleep_disabled_value() -> Option<String> {
 fn sync_pmset_sleep_disabled(state: &mut DaemonState, desired: bool, _config: &AppConfig) {
     if desired && !state.pmset_disabled_by_awake {
         if state.pmset_original_sleep_disabled.is_none() {
-            state.pmset_original_sleep_disabled = get_sleep_disabled_value();
+            state.pmset_original_sleep_disabled =
+                Some(pmset_restore_value(get_sleep_disabled_value().as_deref()));
         }
 
         if run_pmset_command(&["-a", "disablesleep", "1"]) {
@@ -545,6 +546,7 @@ fn recover_stale_pmset_state() {
     let Some(restore_value) = read_pmset_restore_value() else {
         return;
     };
+    let restore_value = pmset_restore_value(Some(&restore_value));
 
     let current_value = get_sleep_disabled_value();
     if current_value.as_deref() == Some("1")
@@ -557,6 +559,14 @@ fn recover_stale_pmset_state() {
     }
 
     clear_pmset_restore_value();
+}
+
+fn pmset_restore_value(value: Option<&str>) -> String {
+    match value {
+        Some("0") => "0".to_string(),
+        Some("1") => "0".to_string(),
+        _ => "0".to_string(),
+    }
 }
 
 fn persist_pmset_restore_value(value: &str) {
@@ -1009,6 +1019,17 @@ mod tests {
     #[test]
     fn active_window_uses_three_polls() {
         assert_eq!(ACTIVE_SESSION_WINDOW_SECS, 15);
+    }
+
+    #[test]
+    fn pmset_restore_value_does_not_preserve_sleep_disabled_one() {
+        assert_eq!(pmset_restore_value(Some("1")), "0");
+    }
+
+    #[test]
+    fn pmset_restore_value_defaults_to_zero() {
+        assert_eq!(pmset_restore_value(None), "0");
+        assert_eq!(pmset_restore_value(Some("unknown")), "0");
     }
 
     #[test]

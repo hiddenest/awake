@@ -1,6 +1,6 @@
 use super::{
     activity_within_window, age_from_system_time, gui_app_running, home_dir, process_infos,
-    ProcessInfo, SessionPollResult,
+    unfinished_activity_within_window, ProcessInfo, SessionPollResult,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -85,7 +85,9 @@ pub(super) fn poll_session() -> SessionPollResult {
 
     if let Some(activity) = newest_cursor_ide_activity(&home_dir().join(".cursor/projects")) {
         if gui_present
-            && (activity.unfinished_task || activity_within_window(activity.last_activity_age_secs))
+            && (activity_within_window(activity.last_activity_age_secs)
+                || (activity.unfinished_task
+                    && unfinished_activity_within_window(activity.last_activity_age_secs)))
         {
             return SessionPollResult {
                 active: true,

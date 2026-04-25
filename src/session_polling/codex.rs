@@ -1,7 +1,7 @@
 use super::{
     activity_within_window, age_from_epoch_secs, gui_app_running, home_dir, matching_files,
-    process_command_lines, process_infos, sql_quote, sqlite_single_line, ProcessInfo,
-    SessionPollResult, SQLITE_FIELD_SEPARATOR,
+    process_command_lines, process_infos, sql_quote, sqlite_single_line,
+    unfinished_activity_within_window, ProcessInfo, SessionPollResult, SQLITE_FIELD_SEPARATOR,
 };
 
 const CODEX_GUI_APP_NAME: &str = "Codex";
@@ -87,7 +87,10 @@ pub(super) fn poll_session() -> SessionPollResult {
             };
             let worked_for_secs = age_from_epoch_secs(Some(thread.created_at));
 
-            if runtime_present && (activity_within_window(age_secs) || thread.unfinished_turn) {
+            if runtime_present
+                && (activity_within_window(age_secs)
+                    || (thread.unfinished_turn && unfinished_activity_within_window(age_secs)))
+            {
                 return SessionPollResult {
                     active: true,
                     detail: format!(

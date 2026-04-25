@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const TARGETS: [&str; 4] = ["claude-code", "codex", "cursor-agent", "opencode"];
 pub(crate) const ACTIVE_SESSION_WINDOW_SECS: u64 = crate::POLL_INTERVAL_SECS * 3;
+pub(crate) const UNFINISHED_SESSION_WINDOW_SECS: u64 = crate::POLL_INTERVAL_SECS * 120;
 pub(crate) const SQLITE_FIELD_SEPARATOR: char = '\u{1f}';
 
 pub(crate) struct SessionPollResult {
@@ -299,6 +300,10 @@ fn activity_within_window(age_secs: u64) -> bool {
     age_secs <= ACTIVE_SESSION_WINDOW_SECS
 }
 
+fn unfinished_activity_within_window(age_secs: u64) -> bool {
+    age_secs <= UNFINISHED_SESSION_WINDOW_SECS
+}
+
 fn age_from_epoch_secs(value: Option<u64>) -> Option<u64> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
     let value = value?;
@@ -440,5 +445,19 @@ mod tests {
     #[test]
     fn activity_within_window_rejects_stale_updates() {
         assert!(!activity_within_window(ACTIVE_SESSION_WINDOW_SECS + 1));
+    }
+
+    #[test]
+    fn unfinished_activity_within_window_accepts_quiet_turns() {
+        assert!(unfinished_activity_within_window(
+            UNFINISHED_SESSION_WINDOW_SECS
+        ));
+    }
+
+    #[test]
+    fn unfinished_activity_within_window_rejects_stale_turns() {
+        assert!(!unfinished_activity_within_window(
+            UNFINISHED_SESSION_WINDOW_SECS + 1
+        ));
     }
 }
