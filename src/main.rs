@@ -14,7 +14,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 mod session_polling;
 
-use session_polling::{poll_target_session, ACTIVE_SESSION_WINDOW_SECS, TARGETS};
+use session_polling::{
+    codex_debug_report, poll_target_session, ACTIVE_SESSION_WINDOW_SECS, TARGETS,
+};
 
 const PID_FILE: &str = "/tmp/awake.pid";
 const PMSET_STATE_FILE: &str = "/tmp/awake.pmset-state";
@@ -78,6 +80,7 @@ fn main() {
         Some("start") => cmd_start(&config, &args[2..]),
         Some("stop") => cmd_stop(),
         Some("status") => cmd_status(),
+        Some("debug-codex") => cmd_debug_codex(),
         Some("install") => cmd_install(&config, &args[2..]),
         Some("setup") => cmd_setup(&config, &args[2..]),
         Some("uninstall") => cmd_uninstall(),
@@ -90,7 +93,7 @@ fn main() {
 
 fn usage(program: &str) {
     println!(
-        "Usage:\n  {0} start [options]\n    Start the awake daemon in the foreground. The daemon polls session state every {1} seconds and only keeps the Mac awake while a real session is actively progressing.\n\n  {0} stop\n    Stop the running awake daemon and release any active caffeinate/pmset state managed by it.\n\n  {0} status\n    Show whether the daemon is running, the current session state for Claude Code, Codex, Cursor Agent, and OpenCode, and the current SleepDisabled state reported by pmset.\n\n  {0} install [options]\n    Write and load the LaunchAgent plist in ~/Library/LaunchAgents so awake starts automatically at login.\n\n  {0} setup [options]\n    Install or reuse /usr/local/bin/awake, install the LaunchAgent, and optionally configure the pmset sudoers rule for lid-close sleep prevention.\n\n  {0} uninstall\n    Unload and remove the installed LaunchAgent plist.\n\nOptions for start/install/setup:\n  -D, -d, --display      Keep the display awake while a session is active (caffeinate -d).\n  -i, --idle-system      Prevent idle system sleep while a session is active (caffeinate -i).\n\nBehavior notes:\n  - Session providers: claude-code, codex, cursor-agent, opencode\n  - OpenCode is treated as active only when a running OpenCode process matches a non-archived root session for the same directory and that session updated recently\n  - Cursor Agent is treated as active when Cursor IDE has an unfinished agent transcript, a running cursor-agent process has a fresh chat store update, or a cursor-agent --print task is running\n  - Codex is treated as active only when a running Codex process maps to a live rollout file and the matching thread updated recently\n  - Claude Code is treated as active only when a live Claude workspace maps to a project session file that updated recently\n  - A session update is considered active for up to {2} seconds after its latest observed activity\n  - If no options are provided, awake uses the default caffeinate flags: -{3}\n  - setup/install pass the selected flags through to the LaunchAgent configuration",
+        "Usage:\n  {0} start [options]\n    Start the awake daemon in the foreground. The daemon polls session state every {1} seconds and only keeps the Mac awake while a real session is actively progressing.\n\n  {0} stop\n    Stop the running awake daemon and release any active caffeinate/pmset state managed by it.\n\n  {0} status\n    Show whether the daemon is running, the current session state for Claude Code, Codex, Cursor Agent, and OpenCode, and the current SleepDisabled state reported by pmset.\n\n  {0} debug-codex\n    Print a read-only Codex diagnosis report for debugging false active or false idle detections.\n\n  {0} install [options]\n    Write and load the LaunchAgent plist in ~/Library/LaunchAgents so awake starts automatically at login.\n\n  {0} setup [options]\n    Install or reuse /usr/local/bin/awake, install the LaunchAgent, and optionally configure the pmset sudoers rule for lid-close sleep prevention.\n\n  {0} uninstall\n    Unload and remove the installed LaunchAgent plist.\n\nOptions for start/install/setup:\n  -D, -d, --display      Keep the display awake while a session is active (caffeinate -d).\n  -i, --idle-system      Prevent idle system sleep while a session is active (caffeinate -i).\n\nBehavior notes:\n  - Session providers: claude-code, codex, cursor-agent, opencode\n  - OpenCode is treated as active only when a running OpenCode process matches a non-archived root session for the same directory and that session updated recently\n  - Cursor Agent is treated as active when Cursor IDE has an unfinished agent transcript, a running cursor-agent process has a fresh chat store update, or a cursor-agent --print task is running\n  - Codex is treated as active only when a running Codex process maps to a live rollout file and the matching thread updated recently\n  - Claude Code is treated as active only when a live Claude workspace maps to a project session file that updated recently\n  - A session update is considered active for up to {2} seconds after its latest observed activity\n  - If no options are provided, awake uses the default caffeinate flags: -{3}\n  - setup/install pass the selected flags through to the LaunchAgent configuration",
         program, POLL_INTERVAL_SECS, ACTIVE_SESSION_WINDOW_SECS, DEFAULT_CAFFEINATE_FLAGS
     );
 }
@@ -281,6 +284,38 @@ fn cmd_status() {
         "[awake]   pmset SleepDisabled: {}",
         get_sleep_disabled_value().unwrap_or_else(|| "unknown".to_string())
     );
+}
+
+fn cmd_debug_codex() {
+    println!("[awake] Codex debug snapshot");
+    match daemon_status() {
+        Some(DaemonStatus::PidFile(pid)) => {
+            println!("[awake] daemon: running (PID {})", pid);
+        }
+        Some(DaemonStatus::Orphan(pid)) => {
+            println!("[awake] daemon: running (PID {}, no PID file)", pid);
+        }
+        None => {
+            println!("[awake] daemon: stopped");
+        }
+    }
+
+    println!("[awake] providers:");
+    for name in TARGETS {
+        let poll = poll_target_session(name);
+        println!("  {}", provider_status_line(name, &poll));
+        println!("    detail: {}", poll.detail);
+    }
+
+    println!(
+        "[awake] pmset SleepDisabled: {}",
+        get_sleep_disabled_value().unwrap_or_else(|| "unknown".to_string())
+    );
+    println!("[awake] caffeinate processes:");
+    for line in process_command_lines_matching("caffeinate") {
+        println!("  {}", line);
+    }
+    println!("{}", codex_debug_report());
 }
 
 fn cmd_install(config: &AppConfig, raw_args: &[String]) {
@@ -904,6 +939,27 @@ fn command_success(program: &str, args: &[&str]) -> bool {
 
 fn command_output(program: &str, args: &[&str]) -> io::Result<std::process::Output> {
     Command::new(program).args(args).output()
+}
+
+fn process_command_lines_matching(process_name: &str) -> Vec<String> {
+    let output = match command_output("ps", &["axww", "-o", "pid=,command="]) {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| {
+            parse_process_line(line)
+                .map(|(_, command)| {
+                    let executable = command.split_whitespace().next().unwrap_or("");
+                    executable == process_name
+                        || executable.rsplit('/').next() == Some(process_name)
+                })
+                .unwrap_or(false)
+        })
+        .map(|line| line.trim().to_string())
+        .collect()
 }
 
 fn provider_status_line(name: &str, poll: &session_polling::SessionPollResult) -> String {

@@ -47,6 +47,10 @@ pub(crate) fn poll_target_session(name: &str) -> SessionPollResult {
     }
 }
 
+pub(crate) fn codex_debug_report() -> String {
+    codex::debug_report()
+}
+
 fn claude_runtime_detail(gui_present: bool, ide_lock_present: bool) -> String {
     match (gui_present, ide_lock_present) {
         (true, true) => "GUI app + IDE lock present".to_string(),

@@ -1,6 +1,6 @@
 use super::{
-    activity_within_window, age_from_epoch_secs, gui_app_running, home_dir, matching_files,
-    process_command_lines, process_infos, sql_quote, sqlite_single_line,
+    activity_within_window, age_from_epoch_secs, age_from_system_time, gui_app_running, home_dir,
+    matching_files, process_command_lines, process_infos, sql_quote, sqlite_single_line,
     unfinished_activity_within_window, ProcessInfo, SessionPollResult, SQLITE_FIELD_SEPARATOR,
 };
 
@@ -25,9 +25,16 @@ struct CodexThread {
     created_at: u64,
     updated_at: u64,
     unfinished_turn: bool,
+    process_kind: CodexProcessKind,
     source: String,
     cwd: String,
     title: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexProcessKind {
+    AppServer,
+    InteractiveCli,
 }
 
 struct CodexProcessFiles {
@@ -38,7 +45,6 @@ struct CodexProcessFiles {
 pub(super) fn poll_session() -> SessionPollResult {
     let gui_present = gui_app_running(CODEX_GUI_APP_NAME);
     let cli_present = codex_cli_session_running();
-    let runtime_present = gui_present || cli_present;
     let fallback_db_paths = matching_files(&home_dir().join(".codex"), "state_*.sqlite");
     if fallback_db_paths.is_empty() {
         return SessionPollResult {
@@ -54,11 +60,8 @@ pub(super) fn poll_session() -> SessionPollResult {
 
     let matched_thread = process_infos(CODEX_PROCESS_NAME)
         .into_iter()
-        .filter(|process| {
-            is_codex_app_server_invocation(&process.command)
-                || is_interactive_codex_invocation(&process.command)
-        })
-        .flat_map(|process| current_threads_for_process(&process, &fallback_db_paths))
+        .filter_map(|process| codex_process_kind(&process.command).map(|kind| (process, kind)))
+        .flat_map(|(process, kind)| current_threads_for_process(&process, kind, &fallback_db_paths))
         .max_by_key(|thread| thread.updated_at);
 
     match matched_thread {
@@ -87,14 +90,12 @@ pub(super) fn poll_session() -> SessionPollResult {
             };
             let worked_for_secs = age_from_epoch_secs(Some(thread.created_at));
 
-            if runtime_present
-                && (activity_within_window(age_secs)
-                    || (thread.unfinished_turn && unfinished_activity_within_window(age_secs)))
-            {
+            if codex_thread_is_active(&thread, age_secs, gui_present, cli_present) {
                 return SessionPollResult {
                     active: true,
                     detail: format!(
-                        "active {} session in {} present (last update {}s ago{}) ({})",
+                        "active {} {} session in {} present (last update {}s ago{}) ({})",
+                        thread.process_kind.detail_label(),
                         thread.source,
                         thread.cwd,
                         age_secs,
@@ -113,7 +114,8 @@ pub(super) fn poll_session() -> SessionPollResult {
             SessionPollResult {
                 active: false,
                 detail: format!(
-                    "idle — process-matched {} thread in {} updated {}s ago ({})",
+                    "idle — process-matched {} {} thread in {} updated {}s ago ({})",
+                    thread.process_kind.detail_label(),
                     thread.source,
                     thread.cwd,
                     age_secs,
@@ -126,8 +128,175 @@ pub(super) fn poll_session() -> SessionPollResult {
     }
 }
 
+pub(super) fn debug_report() -> String {
+    use std::fmt::Write as _;
+
+    let mut report = String::new();
+    let gui_present = gui_app_running(CODEX_GUI_APP_NAME);
+    let cli_present = codex_cli_session_running();
+    let fallback_db_paths = matching_files(&home_dir().join(".codex"), "state_*.sqlite");
+    let poll = poll_session();
+
+    let _ = writeln!(report, "[awake] Codex internals:");
+    let _ = writeln!(report, "  poll.active: {}", poll.active);
+    let _ = writeln!(report, "  poll.detail: {}", poll.detail);
+    let _ = writeln!(
+        report,
+        "  poll.last_activity_age_secs: {}",
+        optional_secs(poll.last_activity_age_secs)
+    );
+    let _ = writeln!(
+        report,
+        "  poll.worked_for_secs: {}",
+        optional_secs(poll.worked_for_secs)
+    );
+    let _ = writeln!(
+        report,
+        "  runtime: gui_present={}, cli_present={} ({})",
+        gui_present,
+        cli_present,
+        runtime_presence_detail(gui_present, cli_present)
+    );
+
+    let _ = writeln!(
+        report,
+        "  fallback state DBs ({}):",
+        fallback_db_paths.len()
+    );
+    if fallback_db_paths.is_empty() {
+        let _ = writeln!(report, "    none");
+    } else {
+        for path in &fallback_db_paths {
+            let _ = writeln!(report, "    {}", path_with_age(path));
+        }
+    }
+
+    let processes = process_infos(CODEX_PROCESS_NAME);
+    let _ = writeln!(report, "  codex processes ({}):", processes.len());
+    if processes.is_empty() {
+        let _ = writeln!(report, "    none");
+        return report;
+    }
+
+    for process in processes {
+        let process_kind = codex_process_kind(&process.command);
+        let _ = writeln!(
+            report,
+            "    pid={} kind={} cwd={}",
+            process.pid,
+            process_kind
+                .map(CodexProcessKind::detail_label)
+                .unwrap_or("ignored"),
+            process
+                .cwd
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+        let _ = writeln!(report, "      command: {}", process.command);
+
+        let CodexProcessFiles {
+            db_paths,
+            rollout_paths,
+        } = codex_process_files(&process);
+        let _ = writeln!(report, "      lsof state DBs ({}):", db_paths.len());
+        if db_paths.is_empty() {
+            let _ = writeln!(report, "        none");
+        } else {
+            for path in &db_paths {
+                let _ = writeln!(report, "        {}", path_with_age(path));
+            }
+        }
+
+        let _ = writeln!(report, "      writable rollouts ({}):", rollout_paths.len());
+        if rollout_paths.is_empty() {
+            let _ = writeln!(report, "        none");
+            continue;
+        }
+
+        let candidate_db_paths = if db_paths.is_empty() {
+            fallback_db_paths.clone()
+        } else {
+            db_paths
+        };
+
+        for rollout_path in &rollout_paths {
+            let unfinished_turn = rollout_has_unfinished_turn(rollout_path);
+            let _ = writeln!(
+                report,
+                "        {} unfinished_turn={}",
+                path_with_age(rollout_path),
+                unfinished_turn
+            );
+
+            let Some(kind) = process_kind else {
+                let _ = writeln!(
+                    report,
+                    "          thread lookup skipped for ignored process"
+                );
+                continue;
+            };
+
+            if candidate_db_paths.is_empty() {
+                let _ = writeln!(report, "          no DB available for thread lookup");
+                continue;
+            }
+
+            for db_path in &candidate_db_paths {
+                match thread_for_rollout_path(db_path, rollout_path, kind) {
+                    Some(thread) => {
+                        let age_secs = age_from_epoch_secs(Some(thread.updated_at));
+                        let active = age_secs
+                            .map(|age| {
+                                codex_thread_is_active(&thread, age, gui_present, cli_present)
+                            })
+                            .unwrap_or(false);
+                        let _ = writeln!(
+                            report,
+                            "          thread db={} source={} cwd={} updated={} created={} active={} title={}",
+                            db_path.display(),
+                            thread.source,
+                            thread.cwd,
+                            optional_secs(age_secs),
+                            optional_secs(age_from_epoch_secs(Some(thread.created_at))),
+                            active,
+                            thread.title
+                        );
+                    }
+                    None => {
+                        let _ = writeln!(
+                            report,
+                            "          no thread match in db={}",
+                            db_path.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    report
+}
+
+fn optional_secs(value: Option<u64>) -> String {
+    value
+        .map(|secs| format!("{}s", secs))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn path_with_age(path: &std::path::Path) -> String {
+    let age = std::fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| age_from_system_time(Some(modified)))
+        .map(|secs| format!("modified {}s ago", secs))
+        .unwrap_or_else(|| "modified unknown".to_string());
+    format!("{} ({})", path.display(), age)
+}
+
 fn current_threads_for_process(
     process: &ProcessInfo,
+    process_kind: CodexProcessKind,
     fallback_db_paths: &[std::path::PathBuf],
 ) -> Vec<CodexThread> {
     let CodexProcessFiles {
@@ -147,9 +316,9 @@ fn current_threads_for_process(
     db_paths
         .into_iter()
         .flat_map(|db_path| {
-            rollout_paths
-                .iter()
-                .filter_map(move |rollout_path| thread_for_rollout_path(&db_path, rollout_path))
+            rollout_paths.iter().filter_map(move |rollout_path| {
+                thread_for_rollout_path(&db_path, rollout_path, process_kind)
+            })
         })
         .collect()
 }
@@ -210,6 +379,7 @@ fn parse_codex_process_files(output: &str) -> CodexProcessFiles {
 fn thread_for_rollout_path(
     db_path: &std::path::Path,
     rollout_path: &std::path::Path,
+    process_kind: CodexProcessKind,
 ) -> Option<CodexThread> {
     let query = format!(
         "select created_at,updated_at,source,cwd,title from threads where archived = 0 and rollout_path = '{}' limit 1;",
@@ -221,10 +391,29 @@ fn thread_for_rollout_path(
         created_at: parts.next()?.parse().ok()?,
         updated_at: parts.next()?.parse().ok()?,
         unfinished_turn: rollout_has_unfinished_turn(rollout_path),
+        process_kind,
         source: parts.next()?.to_string(),
         cwd: parts.next()?.to_string(),
         title: parts.next()?.to_string(),
     })
+}
+
+fn codex_thread_is_active(
+    thread: &CodexThread,
+    age_secs: u64,
+    gui_present: bool,
+    cli_present: bool,
+) -> bool {
+    match thread.process_kind {
+        CodexProcessKind::AppServer => {
+            gui_present && thread.unfinished_turn && activity_within_window(age_secs)
+        }
+        CodexProcessKind::InteractiveCli => {
+            cli_present
+                && (activity_within_window(age_secs)
+                    || (thread.unfinished_turn && unfinished_activity_within_window(age_secs)))
+        }
+    }
 }
 
 fn rollout_has_unfinished_turn(path: &std::path::Path) -> bool {
@@ -287,6 +476,27 @@ fn codex_cli_session_running() -> bool {
         .any(|line| is_interactive_codex_invocation(&line))
 }
 
+fn codex_process_kind(command_line: &str) -> Option<CodexProcessKind> {
+    if is_codex_app_server_invocation(command_line) {
+        return Some(CodexProcessKind::AppServer);
+    }
+
+    if is_interactive_codex_invocation(command_line) {
+        return Some(CodexProcessKind::InteractiveCli);
+    }
+
+    None
+}
+
+impl CodexProcessKind {
+    fn detail_label(self) -> &'static str {
+        match self {
+            CodexProcessKind::AppServer => "app-server",
+            CodexProcessKind::InteractiveCli => "CLI",
+        }
+    }
+}
+
 fn is_codex_app_server_invocation(command_line: &str) -> bool {
     let tokens: Vec<&str> = command_line.split_whitespace().collect();
     matches!(tokens.get(1), Some(&"app-server"))
@@ -341,6 +551,18 @@ fn is_interactive_codex_invocation(command_line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn codex_thread(process_kind: CodexProcessKind, unfinished_turn: bool) -> CodexThread {
+        CodexThread {
+            created_at: 1,
+            updated_at: 2,
+            unfinished_turn,
+            process_kind,
+            source: "test".to_string(),
+            cwd: "/tmp/project".to_string(),
+            title: "test thread".to_string(),
+        }
+    }
 
     #[test]
     fn parse_codex_process_files_keeps_live_rollouts_and_state_dbs() {
@@ -420,6 +642,27 @@ codex 123 user 48w REG 1,16 1 /Users/test/.codex/archived_sessions/rollout-c.jso
     }
 
     #[test]
+    fn codex_process_kind_detects_app_server_before_interactive_cli() {
+        assert_eq!(
+            codex_process_kind("codex app-server --analytics-default-enabled"),
+            Some(CodexProcessKind::AppServer)
+        );
+    }
+
+    #[test]
+    fn codex_process_kind_detects_interactive_cli() {
+        assert_eq!(
+            codex_process_kind("codex --model o4-mini fix the login bug"),
+            Some(CodexProcessKind::InteractiveCli)
+        );
+    }
+
+    #[test]
+    fn codex_process_kind_rejects_non_interactive_subcommands() {
+        assert_eq!(codex_process_kind("codex mcp-server"), None);
+    }
+
+    #[test]
     fn codex_mcp_server_is_not_interactive() {
         assert!(!is_interactive_codex_invocation("codex mcp-server"));
     }
@@ -482,5 +725,57 @@ codex 123 user 48w REG 1,16 1 /Users/test/.codex/archived_sessions/rollout-c.jso
 {"timestamp":"2026-04-24T13:00:01.000Z","type":"event_msg","payload":{"aggregated_output":"{\"type\":\"task_complete\",\"turn_id\":\"turn-a\"}"}}"#;
 
         assert!(rollout_content_has_unfinished_turn(content));
+    }
+
+    #[test]
+    fn app_server_thread_requires_unfinished_turn_even_when_recent() {
+        let thread = codex_thread(CodexProcessKind::AppServer, false);
+
+        assert!(!codex_thread_is_active(&thread, 0, true, false));
+    }
+
+    #[test]
+    fn app_server_thread_is_active_for_unfinished_recent_turn() {
+        let thread = codex_thread(CodexProcessKind::AppServer, true);
+
+        assert!(codex_thread_is_active(&thread, 0, true, false));
+    }
+
+    #[test]
+    fn app_server_thread_requires_gui_presence() {
+        let thread = codex_thread(CodexProcessKind::AppServer, true);
+
+        assert!(!codex_thread_is_active(&thread, 0, false, false));
+    }
+
+    #[test]
+    fn app_server_thread_rejects_unfinished_turn_after_fresh_window() {
+        let thread = codex_thread(CodexProcessKind::AppServer, true);
+
+        assert!(!codex_thread_is_active(
+            &thread,
+            super::super::ACTIVE_SESSION_WINDOW_SECS + 1,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn cli_thread_accepts_quiet_unfinished_turn() {
+        let thread = codex_thread(CodexProcessKind::InteractiveCli, true);
+
+        assert!(codex_thread_is_active(
+            &thread,
+            super::super::ACTIVE_SESSION_WINDOW_SECS + 1,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn cli_thread_accepts_recent_finished_activity() {
+        let thread = codex_thread(CodexProcessKind::InteractiveCli, false);
+
+        assert!(codex_thread_is_active(&thread, 0, false, true));
     }
 }

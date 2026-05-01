@@ -74,6 +74,7 @@ For Cursor, `awake` watches both the standalone `cursor-agent` CLI and Cursor ID
 awake start [options]
 awake stop
 awake status
+awake debug-codex
 awake setup [options]
 awake install [options]
 awake uninstall
@@ -82,6 +83,7 @@ awake uninstall
 - `start` — run the daemon in the foreground
 - `stop` — stop the running daemon
 - `status` — show daemon state, provider state, and current `SleepDisabled`
+- `debug-codex` — print a read-only Codex diagnosis report for debugging incorrect Codex activity detection
 - `setup` — install or reuse `/usr/local/bin/awake`, install the LaunchAgent, and optionally configure `pmset` privilege
 - `install` — install only the LaunchAgent
 - `uninstall` — remove the LaunchAgent
@@ -138,6 +140,7 @@ Useful checks:
 
 ```bash
 awake status
+awake debug-codex
 pmset -g assertions
 pgrep -a caffeinate
 pmset -g
